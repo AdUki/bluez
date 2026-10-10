@@ -93,6 +93,26 @@ http://specifications.freedesktop.org/mpris-spec/latest/
 
 Note: If the sender disconnects its objects are automatically unregistered.
 
+The properties are those of **org.mpris.MediaPlayer2.Player** (and Identity of
+**org.mpris.MediaPlayer2**), plus these of **org.bluez.MediaPlayer1(5)** for a
+player whose media library AVRCP controllers can browse:
+
+:boolean Browsable:
+
+	The player object implements **org.bluez.MediaFolder1(5)**: it is the
+	root folder of the library, and its items implement
+	**org.bluez.MediaItem1(5)**.
+
+:boolean Searchable:
+
+	The player implements **org.bluez.MediaFolder1(5)** Search.
+
+:object Playlist:
+
+	The folder object of the now playing list, which ChangeFolder takes like
+	any other folder. Sending it again in PropertiesChanged, also unchanged,
+	tells the controllers that the list changed.
+
 Possible Errors:
 
 :org.bluez.Error.InvalidArguments:

@@ -21,6 +21,14 @@ Interface
 		[variable prefix]/{hci0,hci1,...}/dev_{BDRADDR}/player# (Controller role)
 :Used by:	**bluetoothctl-player(1)**
 
+In the target role the folder interface is on the player object registered
+with **org.bluez.Media(5)** RegisterPlayer: the player has one current folder,
+which bluetoothd moves with ChangeFolder before it lists one (one request at a
+time). The folders are the player object (the root of its library), the items
+whose Type is "folder", the object in the player's Playlist property (the now
+playing list) and the one Search returns. ListItems' Start and End are offsets,
+End included, and its answer the items' **org.bluez.MediaItem1(5)** properties.
+
 Methods
 -------
 
