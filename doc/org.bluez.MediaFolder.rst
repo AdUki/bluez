@@ -23,8 +23,8 @@ Interface
 
 In the target role the folder interface is on the player object registered
 with **org.bluez.Media(5)** RegisterPlayer: the player has one current folder,
-which bluetoothd moves with ChangeFolder before it lists one (one request at a
-time). The folders are the player object (the root of its library), the items
+which bluetoothd moves with ChangeFolder before every listing (one request at a
+time): the player may be browsed through several adapters at once. The folders are the player object (the root of its library), the items
 whose Type is "folder", the object in the player's Playlist property (the now
 playing list) and the one Search returns. ListItems' Start and End are offsets,
 End included, and its answer the items' **org.bluez.MediaItem1(5)** properties.

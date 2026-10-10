@@ -85,8 +85,7 @@ bool local_player_previous(struct local_player *lp);
  * media library is the player object itself; the now playing list is the
  * folder object in its Playlist property. The player has one current folder,
  * shared by everyone browsing it, so each request below first moves it to the
- * folder the request is about (when it is not there already), and requests
- * are run one at a time.
+ * folder the request is about, and requests are run one at a time.
  *
  * The callbacks are called exactly once, also when the player goes away
  * before the answer (err -ECANCELED). err is a negative errno: -ENOTSUP when

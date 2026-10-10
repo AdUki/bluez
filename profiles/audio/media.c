@@ -174,7 +174,6 @@ struct local_player {
 	bool			searchable;
 	char			*playlist;	/* Now playing folder */
 	char			*trackid;	/* The track's object */
-	char			*folder;	/* Its current folder */
 	struct queue		*browse_ops;	/* Head: the one running */
 };
 
@@ -2200,7 +2199,6 @@ static void local_player_destroy(struct local_player *mp)
 	g_free(mp->name);
 	g_free(mp->playlist);
 	g_free(mp->trackid);
-	g_free(mp->folder);
 	queue_destroy(mp->browse_ops, browse_op_free_cb);
 	g_free(mp);
 }
@@ -2472,9 +2470,8 @@ struct btd_adapter *local_player_get_adapter(struct local_player *mp)
 
 /*
  * Browsing (target role, see media.h). Each request is a short chain of calls
- * to the player: a Search (search only), a ChangeFolder when the player's
- * current folder is not the one the request is about, then ListItems or the
- * folder's NumberOfItems. The requests are queued and run one at a time, since
+ * to the player: a Search (search only), a ChangeFolder to the folder the
+ * request is about, then ListItems or the folder's NumberOfItems. The requests are queued and run one at a time, since
  * the current folder is shared: two of them interleaved would list each
  * other's folders.
  */
@@ -2669,11 +2666,11 @@ static int browse_step(struct browse_op *op)
 		/* Not a step of its own: see browse_run */
 		return -EINVAL;
 	case BROWSE_STATE_CHANGE:
-		if (!g_strcmp0(mp->folder, op->folder)) {
-			op->state = BROWSE_STATE_WORK;
-			return browse_step(op);
-		}
-
+		/* Always, also when the folder was the last one set: the
+		 * player's current folder is the player's, and someone else
+		 * may have moved it since (the same player registered on
+		 * another adapter, or its own program).
+		 */
 		msg = dbus_message_new_method_call(mp->sender, mp->path,
 						MEDIA_FOLDER_INTERFACE,
 						"ChangeFolder");
@@ -2925,7 +2922,6 @@ static int parse_num_items(DBusMessage *reply, uint32_t *num)
 static void browse_reply(DBusPendingCall *call, void *user_data)
 {
 	struct browse_op *op = user_data;
-	struct local_player *mp = op->mp;
 	DBusMessage *reply = dbus_pending_call_steal_reply(call);
 	const char *path;
 	GSList *items;
@@ -2936,14 +2932,8 @@ static void browse_reply(DBusPendingCall *call, void *user_data)
 	op->call = NULL;
 
 	err = browse_error(reply);
-	if (err < 0) {
-		/* Where a failed ChangeFolder left the player is not known */
-		if (op->state == BROWSE_STATE_CHANGE) {
-			g_free(mp->folder);
-			mp->folder = NULL;
-		}
+	if (err < 0)
 		goto done;
-	}
 
 	switch (op->state) {
 	case BROWSE_STATE_QUEUED:
@@ -2966,8 +2956,6 @@ static void browse_reply(DBusPendingCall *call, void *user_data)
 		}
 		break;
 	case BROWSE_STATE_CHANGE:
-		g_free(mp->folder);
-		mp->folder = g_strdup(op->folder);
 		op->state = BROWSE_STATE_WORK;
 		err = browse_step(op);
 		if (!err) {
