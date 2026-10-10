@@ -138,6 +138,74 @@ static bool lp_previous(void *user_data)
 	return local_player_previous(p->lp);
 }
 
+static bool lp_browsable(void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_browsable(p->lp);
+}
+
+static bool lp_searchable(void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_searchable(p->lp);
+}
+
+static const char *lp_get_root(void *user_data)
+{
+	struct player_link *p = user_data;
+
+	/* The player object is the root folder of its library */
+	return local_player_get_path(p->lp);
+}
+
+static const char *lp_get_now_playing(void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_get_playlist(p->lp);
+}
+
+static int lp_change_folder(const char *folder, avrcp_folder_cb cb,
+					void *cb_data, void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_change_folder(p->lp, folder, cb, cb_data);
+}
+
+static int lp_list_items(const char *folder, uint32_t start, uint32_t end,
+				avrcp_items_cb cb, void *cb_data,
+				void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_list_items(p->lp, folder, start, end, cb, cb_data);
+}
+
+static int lp_search(const char *value, avrcp_search_cb cb, void *cb_data,
+							void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_search(p->lp, value, cb, cb_data);
+}
+
+static int lp_play_item(const char *item, void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_play_item(p->lp, item);
+}
+
+static int lp_add_to_now_playing(const char *item, void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_add_to_now_playing(p->lp, item);
+}
+
 static struct avrcp_player_cb avrcp_cb = {
 	.list_settings = lp_list_settings,
 	.get_setting = lp_get_setting,
@@ -154,6 +222,15 @@ static struct avrcp_player_cb avrcp_cb = {
 	.pause = lp_pause,
 	.next = lp_next,
 	.previous = lp_previous,
+	.browsable = lp_browsable,
+	.searchable = lp_searchable,
+	.get_root = lp_get_root,
+	.get_now_playing = lp_get_now_playing,
+	.change_folder = lp_change_folder,
+	.list_items = lp_list_items,
+	.search = lp_search,
+	.play_item = lp_play_item,
+	.add_to_now_playing = lp_add_to_now_playing,
 };
 
 static void status_changed(void *user_data)
@@ -211,6 +288,13 @@ static void settings_changed(const char *key, void *user_data)
 	avrcp_player_event(p->avrcp, AVRCP_EVENT_SETTINGS_CHANGED, key);
 }
 
+static void now_playing_changed(void *user_data)
+{
+	struct player_link *p = user_data;
+
+	avrcp_player_event(p->avrcp, AVRCP_EVENT_NOW_PLAYING_CHANGED, NULL);
+}
+
 static void player_removed(void *user_data)
 {
 	struct player_link *p = user_data;
@@ -225,6 +309,7 @@ static const struct local_player_callback player_cb =  {
 	.track_position = track_position,
 	.track_changed = track_changed,
 	.settings_changed = settings_changed,
+	.now_playing_changed = now_playing_changed,
 	.player_removed = player_removed,
 };
 

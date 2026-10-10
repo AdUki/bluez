@@ -221,6 +221,14 @@ struct avrcp_player {
 	struct avrcp_player_cb *cb;
 	void *user_data;
 	GDestroyNotify destroy;
+
+	/* Target role browsing: the items listed so far, by path (owning)
+	 * and by UID, and the requests waiting for the player.
+	 */
+	GHashTable *tg_items;
+	GHashTable *tg_uids;
+	uint64_t tg_next_uid;
+	GSList *tg_reqs;
 };
 
 struct avrcp_data {
@@ -250,6 +258,17 @@ struct avrcp {
 	uint16_t supported_events;
 	uint8_t transaction;
 	struct pending_pdu *pending_pdu;
+
+	/* Target role browsing: the browsed player, its folders from the
+	 * current one to the root, the last search's folder, the requests
+	 * waiting for the player, and that the browsing command being
+	 * handled is answered later.
+	 */
+	struct avrcp_player *tg_browsed;
+	GSList *tg_vfs;
+	char *tg_search;
+	GSList *tg_reqs;
+	bool tg_deferred;
 };
 
 struct passthrough_handler {
@@ -804,6 +823,7 @@ void avrcp_player_event(struct avrcp_player *player, uint8_t id,
 		memcpy(&pdu->params[3], &player->uid_counter, sizeof(uint16_t));
 		break;
 	case AVRCP_EVENT_AVAILABLE_PLAYERS_CHANGED:
+	case AVRCP_EVENT_NOW_PLAYING_CHANGED:
 		size = 1;
 		break;
 	default:
@@ -1642,6 +1662,7 @@ static uint8_t avrcp_handle_register_notification(struct avrcp *session,
 		bt_put_be16(player_get_uid_counter(player), &pdu->params[3]);
 		break;
 	case AVRCP_EVENT_AVAILABLE_PLAYERS_CHANGED:
+	case AVRCP_EVENT_NOW_PLAYING_CHANGED:
 		len = 1;
 		break;
 	case AVRCP_EVENT_VOLUME_CHANGED:
@@ -1868,6 +1889,920 @@ err:
 	return AVC_CTYPE_REJECTED;
 }
 
+/*
+ * Target role browsing: the media library of a local player (a program that
+ * registered one with org.bluez.Media1, see media.h), served to the remote
+ * controller. Its folders and items are D-Bus objects; the controller knows
+ * them by UIDs, which are handed out here as items are listed and stay the
+ * same while the player is registered (the player's UIDs are unique, and its
+ * UID counter does not change). The answers come from the player over D-Bus,
+ * so the browsing commands are answered later, with avctp_send_browsing_rsp().
+ */
+
+#define AVRCP_STATUS_INVALID_DIRECTION		0x07
+#define AVRCP_STATUS_NOT_A_DIRECTORY		0x08
+#define AVRCP_STATUS_NOT_PLAYABLE		0x0c
+#define AVRCP_STATUS_SEARCH_NOT_SUPPORTED	0x0f
+#define AVRCP_STATUS_NO_SEARCH_RESULTS		0x14
+
+#define AVRCP_ITEM_FOLDER		0x02
+#define AVRCP_ITEM_MEDIA		0x03
+
+struct tg_item {
+	uint64_t uid;
+	struct local_player_item *item;
+};
+
+struct tg_browse_req {
+	struct avrcp *session;		/* NULL once the session is gone */
+	struct avrcp_player *player;	/* NULL once the player is gone */
+	uint8_t transaction;
+	uint8_t pdu_id;
+	uint8_t direction;
+	char *folder;
+	bool attrs_all;
+	uint8_t nattr;
+	uint32_t attrs[AVRCP_MEDIA_ATTRIBUTE_LAST];
+};
+
+static bool tg_browsable(struct avrcp_player *player)
+{
+	return player && player->cb->browsable &&
+				player->cb->browsable(player->user_data);
+}
+
+static bool tg_searchable(struct avrcp_player *player)
+{
+	return tg_browsable(player) && player->cb->searchable &&
+				player->cb->searchable(player->user_data);
+}
+
+static uint16_t tg_uid_counter(struct avrcp_player *player)
+{
+	/* A database aware player has a UID counter other than 0 */
+	return tg_browsable(player) ? 1 : 0;
+}
+
+static void tg_item_free(void *data)
+{
+	struct tg_item *t = data;
+
+	local_player_item_free(t->item);
+	g_free(t);
+}
+
+/* The UID of an item just listed: the one it had, or a new one. */
+static uint64_t tg_item_add(struct avrcp_player *player,
+					struct local_player_item *item)
+{
+	struct tg_item *t;
+
+	if (!player->tg_items) {
+		player->tg_items = g_hash_table_new_full(g_str_hash,
+						g_str_equal, NULL, tg_item_free);
+		player->tg_uids = g_hash_table_new(g_int64_hash,
+							g_int64_equal);
+	}
+
+	t = g_hash_table_lookup(player->tg_items, item->path);
+	if (t) {
+		/* Keyed by the item's path: the new one keeps the key */
+		g_hash_table_steal(player->tg_items, t->item->path);
+		local_player_item_free(t->item);
+		t->item = item;
+		g_hash_table_insert(player->tg_items, item->path, t);
+		return t->uid;
+	}
+
+	t = g_new0(struct tg_item, 1);
+	t->uid = ++player->tg_next_uid;
+	t->item = item;
+	g_hash_table_insert(player->tg_items, item->path, t);
+	g_hash_table_insert(player->tg_uids, &t->uid, t);
+
+	return t->uid;
+}
+
+static struct local_player_item *tg_item_find(struct avrcp_player *player,
+								uint64_t uid)
+{
+	struct tg_item *t;
+
+	if (!player || !player->tg_uids)
+		return NULL;
+
+	t = g_hash_table_lookup(player->tg_uids, &uid);
+
+	return t ? t->item : NULL;
+}
+
+static void tg_items_free(struct avrcp_player *player)
+{
+	if (!player->tg_items)
+		return;
+
+	g_hash_table_destroy(player->tg_uids);
+	g_hash_table_destroy(player->tg_items);
+	player->tg_uids = NULL;
+	player->tg_items = NULL;
+}
+
+static void tg_browse_reset(struct avrcp *session)
+{
+	g_slist_free_full(session->tg_vfs, g_free);
+	session->tg_vfs = NULL;
+	g_free(session->tg_search);
+	session->tg_search = NULL;
+	session->tg_browsed = NULL;
+}
+
+static struct tg_browse_req *tg_req_new(struct avrcp *session,
+					struct avrcp_player *player,
+					struct avrcp_browsing_header *pdu,
+					uint8_t transaction)
+{
+	struct tg_browse_req *req = g_new0(struct tg_browse_req, 1);
+
+	req->session = session;
+	req->player = player;
+	req->transaction = transaction;
+	req->pdu_id = pdu->pdu_id;
+
+	session->tg_reqs = g_slist_prepend(session->tg_reqs, req);
+	player->tg_reqs = g_slist_prepend(player->tg_reqs, req);
+
+	return req;
+}
+
+static void tg_req_free(struct tg_browse_req *req)
+{
+	if (req->session)
+		req->session->tg_reqs = g_slist_remove(req->session->tg_reqs,
+									req);
+	if (req->player)
+		req->player->tg_reqs = g_slist_remove(req->player->tg_reqs,
+									req);
+	g_free(req->folder);
+	g_free(req);
+}
+
+static void tg_req_orphan_session(void *data)
+{
+	struct tg_browse_req *req = data;
+
+	req->session = NULL;
+}
+
+static void tg_req_orphan_player(void *data)
+{
+	struct tg_browse_req *req = data;
+
+	req->player = NULL;
+}
+
+/* A response buffer the size of what the remote takes. */
+static struct avrcp_browsing_header *tg_rsp_new(struct tg_browse_req *req,
+							uint16_t *max)
+{
+	struct avrcp_browsing_header *rsp;
+	uint16_t mtu = avctp_get_browsing_mtu(req->session->conn);
+
+	if (mtu < AVRCP_BROWSING_HEADER_LENGTH + 16)
+		mtu = AVRCP_BROWSING_HEADER_LENGTH + 16;
+
+	rsp = g_malloc0(mtu);
+	rsp->pdu_id = req->pdu_id;
+	*max = mtu - AVRCP_BROWSING_HEADER_LENGTH;
+
+	return rsp;
+}
+
+static void tg_rsp_send(struct tg_browse_req *req,
+			struct avrcp_browsing_header *rsp, uint16_t len)
+{
+	rsp->param_len = cpu_to_be16(len);
+	avctp_send_browsing_rsp(req->session->conn, req->transaction,
+				(void *) rsp, AVRCP_BROWSING_HEADER_LENGTH + len);
+	g_free(rsp);
+}
+
+static uint8_t tg_status(int err)
+{
+	switch (err) {
+	case 0:
+		return AVRCP_STATUS_SUCCESS;
+	case -ENOENT:
+		return AVRCP_STATUS_DOES_NOT_EXIST;
+	case -ENOTSUP:
+		return AVRCP_STATUS_PLAYER_NOT_BROWSABLE;
+	case -ERANGE:
+		return AVRCP_STATUS_OUT_OF_BOUNDS;
+	default:
+		return AVRCP_STATUS_INTERNAL_ERROR;
+	}
+}
+
+/* Answers with a status alone, and frees the request. */
+static void tg_reply_status(struct tg_browse_req *req, uint8_t status)
+{
+	struct avrcp_browsing_header *rsp;
+	uint16_t max;
+
+	if (req->session) {
+		rsp = tg_rsp_new(req, &max);
+		rsp->params[0] = status;
+		tg_rsp_send(req, rsp, 1);
+	}
+
+	tg_req_free(req);
+}
+
+/* Answers now, in the command's buffer. */
+static void tg_browse_reject(struct avrcp_browsing_header *pdu,
+							uint8_t status)
+{
+	pdu->params[0] = status;
+	pdu->param_len = cpu_to_be16(1);
+}
+
+static void tg_set_browsed_cb(int err, uint32_t num_items, void *user_data)
+{
+	struct tg_browse_req *req = user_data;
+	struct avrcp *session = req->session;
+	struct avrcp_browsing_header *rsp;
+	uint16_t max;
+
+	if (err || !session || !req->player) {
+		tg_reply_status(req, tg_status(err ? err : -ECANCELED));
+		return;
+	}
+
+	tg_browse_reset(session);
+	session->tg_browsed = req->player;
+	session->tg_vfs = g_slist_prepend(NULL, g_strdup(req->folder));
+
+	rsp = tg_rsp_new(req, &max);
+	rsp->params[0] = AVRCP_STATUS_SUCCESS;
+	put_be16(tg_uid_counter(req->player), &rsp->params[1]);
+	put_be32(num_items, &rsp->params[3]);
+	put_be16(AVRCP_CHARSET_UTF8, &rsp->params[7]);
+	rsp->params[9] = 0;	/* folder depth: the root */
+	tg_rsp_send(req, rsp, 10);
+
+	tg_req_free(req);
+}
+
+static void avrcp_handle_set_browsed_player(struct avrcp *session,
+				struct avrcp_browsing_header *pdu,
+				uint8_t transaction)
+{
+	struct avrcp_player *player = NULL;
+	struct tg_browse_req *req;
+	uint16_t player_id;
+	const char *root;
+	GSList *l;
+	int err;
+
+	if (be16_to_cpu(pdu->param_len) < 2 || !session->target) {
+		tg_browse_reject(pdu, AVRCP_STATUS_INVALID_PARAM);
+		return;
+	}
+
+	player_id = get_be16(&pdu->params[0]);
+
+	for (l = session->server->players; l; l = l->next) {
+		struct avrcp_player *p = l->data;
+
+		if (p->id == player_id) {
+			player = p;
+			break;
+		}
+	}
+
+	if (!player) {
+		tg_browse_reject(pdu, AVRCP_STATUS_INVALID_PLAYER_ID);
+		return;
+	}
+
+	root = tg_browsable(player) && player->cb->get_root ?
+			player->cb->get_root(player->user_data) : NULL;
+	if (!root) {
+		tg_browse_reject(pdu, AVRCP_STATUS_PLAYER_NOT_BROWSABLE);
+		return;
+	}
+
+	req = tg_req_new(session, player, pdu, transaction);
+	req->folder = g_strdup(root);
+
+	err = player->cb->change_folder(root, tg_set_browsed_cb, req,
+							player->user_data);
+	if (err < 0) {
+		tg_req_free(req);
+		tg_browse_reject(pdu, tg_status(err));
+		return;
+	}
+
+	session->tg_deferred = true;
+}
+
+static void tg_change_path_cb(int err, uint32_t num_items, void *user_data)
+{
+	struct tg_browse_req *req = user_data;
+	struct avrcp *session = req->session;
+	struct avrcp_browsing_header *rsp;
+	uint16_t max;
+	GSList *top;
+
+	if (err || !session || !req->player ||
+					session->tg_browsed != req->player) {
+		tg_reply_status(req, tg_status(err ? err : -ECANCELED));
+		return;
+	}
+
+	if (req->direction == 0x00) {
+		top = session->tg_vfs;
+		session->tg_vfs = g_slist_remove_link(session->tg_vfs, top);
+		g_slist_free_full(top, g_free);
+	} else
+		session->tg_vfs = g_slist_prepend(session->tg_vfs,
+						g_strdup(req->folder));
+
+	rsp = tg_rsp_new(req, &max);
+	rsp->params[0] = AVRCP_STATUS_SUCCESS;
+	put_be32(num_items, &rsp->params[1]);
+	tg_rsp_send(req, rsp, 5);
+
+	tg_req_free(req);
+}
+
+static void avrcp_handle_change_path(struct avrcp *session,
+				struct avrcp_browsing_header *pdu,
+				uint8_t transaction)
+{
+	struct avrcp_player *player = session->tg_browsed;
+	struct local_player_item *item;
+	struct tg_browse_req *req;
+	const char *folder;
+	uint8_t direction;
+	int err;
+
+	if (be16_to_cpu(pdu->param_len) < 11) {
+		tg_browse_reject(pdu, AVRCP_STATUS_INVALID_PARAM);
+		return;
+	}
+
+	if (!player || !session->tg_vfs) {
+		tg_browse_reject(pdu, AVRCP_STATUS_PLAYER_NOT_BROWSABLE);
+		return;
+	}
+
+	direction = pdu->params[2];
+
+	switch (direction) {
+	case 0x00:	/* Folder Up */
+		if (!session->tg_vfs->next) {
+			tg_browse_reject(pdu, AVRCP_STATUS_INVALID_DIRECTION);
+			return;
+		}
+		folder = session->tg_vfs->next->data;
+		break;
+	case 0x01:	/* Folder Down */
+		item = tg_item_find(player, get_be64(&pdu->params[3]));
+		if (!item) {
+			tg_browse_reject(pdu, AVRCP_STATUS_DOES_NOT_EXIST);
+			return;
+		}
+		if (strcmp(item->type, "folder")) {
+			tg_browse_reject(pdu, AVRCP_STATUS_NOT_A_DIRECTORY);
+			return;
+		}
+		folder = item->path;
+		break;
+	default:
+		tg_browse_reject(pdu, AVRCP_STATUS_INVALID_DIRECTION);
+		return;
+	}
+
+	req = tg_req_new(session, player, pdu, transaction);
+	req->direction = direction;
+	req->folder = g_strdup(folder);
+
+	err = player->cb->change_folder(req->folder, tg_change_path_cb, req,
+							player->user_data);
+	if (err < 0) {
+		tg_req_free(req);
+		tg_browse_reject(pdu, tg_status(err));
+		return;
+	}
+
+	session->tg_deferred = true;
+}
+
+/* The player and folder a scope is about, or a status to answer with. */
+static uint8_t tg_scope(struct avrcp *session, uint8_t scope,
+				struct avrcp_player **player,
+				const char **folder)
+{
+	struct avrcp_player *p;
+
+	switch (scope) {
+	case AVRCP_SCOPE_MEDIA_PLAYER_VFS:
+		if (!session->tg_browsed || !session->tg_vfs)
+			return AVRCP_STATUS_PLAYER_NOT_BROWSABLE;
+		*player = session->tg_browsed;
+		*folder = session->tg_vfs->data;
+		return AVRCP_STATUS_SUCCESS;
+	case AVRCP_SCOPE_SEARCH:
+		if (!session->tg_browsed)
+			return AVRCP_STATUS_PLAYER_NOT_BROWSABLE;
+		if (!session->tg_search)
+			return AVRCP_STATUS_NO_SEARCH_RESULTS;
+		*player = session->tg_browsed;
+		*folder = session->tg_search;
+		return AVRCP_STATUS_SUCCESS;
+	case AVRCP_SCOPE_NOW_PLAYING:
+		/* The addressed player's, or the browsed one's */
+		p = target_get_player(session);
+		if (!tg_browsable(p))
+			p = session->tg_browsed;
+		if (!tg_browsable(p) || !p->cb->get_now_playing)
+			return AVRCP_STATUS_PLAYER_NOT_BROWSABLE;
+		*folder = p->cb->get_now_playing(p->user_data);
+		if (!*folder)
+			return AVRCP_STATUS_DOES_NOT_EXIST;
+		*player = p;
+		return AVRCP_STATUS_SUCCESS;
+	}
+
+	return AVRCP_STATUS_INVALID_SCOPE;
+}
+
+static uint8_t folder_type_to_val(const char *type)
+{
+	static const char *types[] = { "mixed", "titles", "albums", "artists",
+					"genres", "playlists", "years" };
+	unsigned int i;
+
+	for (i = 0; type && i < G_N_ELEMENTS(types); i++) {
+		if (!strcmp(type, types[i]))
+			return i;
+	}
+
+	return 0;
+}
+
+/* One attribute (ID, charset, length, value), cut to what fits in max.
+ * False when not even its header fits.
+ */
+static bool tg_put_attr(uint8_t *buf, uint16_t *pos, uint16_t max,
+					uint32_t id, const char *value)
+{
+	size_t len = strlen(value);
+
+	if (*pos + 8 > max)
+		return false;
+
+	if (len > (size_t) (max - *pos - 8))
+		len = max - *pos - 8;
+
+	put_be32(id, &buf[*pos]);
+	put_be16(AVRCP_CHARSET_UTF8, &buf[*pos + 4]);
+	put_be16(len, &buf[*pos + 6]);
+	memcpy(&buf[*pos + 8], value, len);
+	*pos += 8 + len;
+
+	return true;
+}
+
+/* The attributes asked for that the item has: *n of them, from pos on. */
+static void tg_put_attrs(struct tg_browse_req *req,
+				struct local_player_item *item, uint8_t *buf,
+				uint16_t *pos, uint16_t max, uint8_t *n)
+{
+	uint32_t id;
+	unsigned int i;
+
+	*n = 0;
+
+	for (i = 0; ; i++) {
+		const char *value;
+
+		if (req->attrs_all) {
+			id = i + 1;
+			if (id > AVRCP_MEDIA_ATTRIBUTE_LAST)
+				break;
+		} else {
+			if (i >= req->nattr)
+				break;
+			id = req->attrs[i];
+		}
+
+		value = metadata_to_str(id);
+		value = value ? g_hash_table_lookup(item->metadata, value) :
+									NULL;
+		if (!value && id == AVRCP_MEDIA_ATTRIBUTE_TITLE)
+			value = item->name;
+		if (!value)
+			continue;
+
+		if (!tg_put_attr(buf, pos, max, id, value))
+			break;
+		(*n)++;
+	}
+}
+
+/* An item of a GetFolderItems response, or false when it does not fit. */
+static bool tg_put_item(struct tg_browse_req *req, uint64_t uid,
+				struct local_player_item *item, uint8_t *buf,
+				uint16_t *pos, uint16_t max)
+{
+	uint16_t start = *pos, p = *pos + 3;
+	size_t namelen = strlen(item->name);
+	bool folder = !strcmp(item->type, "folder");
+	uint8_t n;
+
+	/* Header, UID, type(s), charset, name length: the name has to fit too,
+	 * but the attributes may be cut.
+	 */
+	if (p + 8 + (folder ? 2 : 1) + 4 + namelen > max)
+		return false;
+
+	put_be64(uid, &buf[p]);
+	p += 8;
+
+	if (folder) {
+		buf[p++] = folder_type_to_val(item->folder_type);
+		buf[p++] = item->playable ? 0x01 : 0x00;
+	} else
+		buf[p++] = !strcmp(item->type, "video") ? 0x01 : 0x00;
+
+	put_be16(AVRCP_CHARSET_UTF8, &buf[p]);
+	put_be16(namelen, &buf[p + 2]);
+	memcpy(&buf[p + 4], item->name, namelen);
+	p += 4 + namelen;
+
+	if (!folder) {
+		uint16_t count = p++;
+
+		if (p > max)
+			return false;
+		tg_put_attrs(req, item, buf, &p, max, &n);
+		buf[count] = n;
+	}
+
+	buf[start] = folder ? AVRCP_ITEM_FOLDER : AVRCP_ITEM_MEDIA;
+	put_be16(p - start - 3, &buf[start + 1]);
+	*pos = p;
+
+	return true;
+}
+
+static void tg_list_items_cb(int err, GSList *items, void *user_data)
+{
+	struct tg_browse_req *req = user_data;
+	struct avrcp_browsing_header *rsp;
+	uint16_t max, pos = 5, n = 0;
+	bool full = false;
+	GSList *l;
+
+	if (!err && !items)
+		err = -ERANGE;
+
+	if (err || !req->session || !req->player) {
+		g_slist_free_full(items, local_player_item_free);
+		tg_reply_status(req, tg_status(err ? err : -ECANCELED));
+		return;
+	}
+
+	rsp = tg_rsp_new(req, &max);
+
+	/* The player's UID table takes the items over, also those that do not
+	 * fit: the controller asks for them by UID next.
+	 */
+	for (l = items; l; l = l->next) {
+		struct local_player_item *item = l->data;
+		uint64_t uid = tg_item_add(req->player, item);
+
+		if (full)
+			continue;
+		if (tg_put_item(req, uid, item, rsp->params, &pos, max))
+			n++;
+		else
+			full = true;
+	}
+
+	g_slist_free(items);
+
+	if (!n) {
+		g_free(rsp);
+		tg_reply_status(req, AVRCP_STATUS_INTERNAL_ERROR);
+		return;
+	}
+
+	rsp->params[0] = AVRCP_STATUS_SUCCESS;
+	put_be16(tg_uid_counter(req->player), &rsp->params[1]);
+	put_be16(n, &rsp->params[3]);
+	tg_rsp_send(req, rsp, pos);
+
+	tg_req_free(req);
+}
+
+/* The attribute list of a GetFolderItems or GetItemAttributes command. */
+static void tg_req_attrs(struct tg_browse_req *req, uint8_t count,
+					const uint8_t *ids, uint16_t avail)
+{
+	unsigned int i;
+
+	req->attrs_all = count == 0x00;
+	if (count == 0x00 || count == 0xff)
+		return;
+
+	for (i = 0; i < count && (i + 1) * 4 <= avail; i++) {
+		uint32_t id = get_be32(&ids[i * 4]);
+
+		if (id == AVRCP_MEDIA_ATTRIBUTE_ILLEGAL ||
+				id > AVRCP_MEDIA_ATTRIBUTE_LAST ||
+				req->nattr == G_N_ELEMENTS(req->attrs))
+			continue;
+		req->attrs[req->nattr++] = id;
+	}
+}
+
+static void tg_get_folder_items(struct avrcp *session,
+				struct avrcp_browsing_header *pdu,
+				uint8_t transaction, uint8_t scope,
+				uint32_t start, uint32_t end)
+{
+	uint16_t len = be16_to_cpu(pdu->param_len);
+	struct avrcp_player *player;
+	struct tg_browse_req *req;
+	const char *folder;
+	uint8_t status;
+	int err;
+
+	status = tg_scope(session, scope, &player, &folder);
+	if (status != AVRCP_STATUS_SUCCESS) {
+		tg_browse_reject(pdu, status);
+		return;
+	}
+
+	req = tg_req_new(session, player, pdu, transaction);
+	tg_req_attrs(req, pdu->params[9], &pdu->params[10], len - 10);
+
+	err = player->cb->list_items(folder, start, end, tg_list_items_cb, req,
+							player->user_data);
+	if (err < 0) {
+		tg_req_free(req);
+		tg_browse_reject(pdu, tg_status(err));
+		return;
+	}
+
+	session->tg_deferred = true;
+}
+
+static void avrcp_handle_get_item_attributes(struct avrcp *session,
+				struct avrcp_browsing_header *pdu,
+				uint8_t transaction)
+{
+	uint16_t len = be16_to_cpu(pdu->param_len);
+	struct avrcp_browsing_header *rsp;
+	struct local_player_item *item;
+	struct avrcp_player *player;
+	struct tg_browse_req *req;
+	const char *folder;
+	uint16_t max, pos = 2;
+	uint8_t status, n;
+
+	if (len < 12) {
+		tg_browse_reject(pdu, AVRCP_STATUS_INVALID_PARAM);
+		return;
+	}
+
+	status = tg_scope(session, pdu->params[0], &player, &folder);
+	if (status != AVRCP_STATUS_SUCCESS) {
+		tg_browse_reject(pdu, status);
+		return;
+	}
+
+	/* Known from the listing the controller got the UID from */
+	item = tg_item_find(player, get_be64(&pdu->params[1]));
+	if (!item) {
+		tg_browse_reject(pdu, AVRCP_STATUS_DOES_NOT_EXIST);
+		return;
+	}
+
+	req = tg_req_new(session, player, pdu, transaction);
+	tg_req_attrs(req, pdu->params[11], &pdu->params[12], len - 12);
+
+	rsp = tg_rsp_new(req, &max);
+	tg_put_attrs(req, item, rsp->params, &pos, max, &n);
+	rsp->params[0] = AVRCP_STATUS_SUCCESS;
+	rsp->params[1] = n;
+	tg_rsp_send(req, rsp, pos);
+	tg_req_free(req);
+
+	session->tg_deferred = true;
+}
+
+static void tg_num_items_cb(int err, uint32_t num_items, void *user_data)
+{
+	struct tg_browse_req *req = user_data;
+	struct avrcp_browsing_header *rsp;
+	uint16_t max;
+
+	if (err || !req->session || !req->player) {
+		tg_reply_status(req, tg_status(err ? err : -ECANCELED));
+		return;
+	}
+
+	rsp = tg_rsp_new(req, &max);
+	rsp->params[0] = AVRCP_STATUS_SUCCESS;
+	put_be16(tg_uid_counter(req->player), &rsp->params[1]);
+	put_be32(num_items, &rsp->params[3]);
+	tg_rsp_send(req, rsp, 7);
+
+	tg_req_free(req);
+}
+
+static void tg_get_total_number_of_items(struct avrcp *session,
+				struct avrcp_browsing_header *pdu,
+				uint8_t transaction, uint8_t scope)
+{
+	struct avrcp_player *player;
+	struct tg_browse_req *req;
+	const char *folder;
+	uint8_t status;
+	int err;
+
+	status = tg_scope(session, scope, &player, &folder);
+	if (status != AVRCP_STATUS_SUCCESS) {
+		tg_browse_reject(pdu, status);
+		return;
+	}
+
+	req = tg_req_new(session, player, pdu, transaction);
+
+	err = player->cb->change_folder(folder, tg_num_items_cb, req,
+							player->user_data);
+	if (err < 0) {
+		tg_req_free(req);
+		tg_browse_reject(pdu, tg_status(err));
+		return;
+	}
+
+	session->tg_deferred = true;
+}
+
+static void tg_search_cb(int err, const char *folder, uint32_t num_items,
+							void *user_data)
+{
+	struct tg_browse_req *req = user_data;
+	struct avrcp *session = req->session;
+	struct avrcp_browsing_header *rsp;
+	uint16_t max;
+
+	if (err || !session || !req->player ||
+					session->tg_browsed != req->player) {
+		tg_reply_status(req, err == -ENOTSUP ?
+				AVRCP_STATUS_SEARCH_NOT_SUPPORTED :
+				tg_status(err ? err : -ECANCELED));
+		return;
+	}
+
+	g_free(session->tg_search);
+	session->tg_search = g_strdup(folder);
+
+	rsp = tg_rsp_new(req, &max);
+	rsp->params[0] = AVRCP_STATUS_SUCCESS;
+	put_be16(tg_uid_counter(req->player), &rsp->params[1]);
+	put_be32(num_items, &rsp->params[3]);
+	tg_rsp_send(req, rsp, 7);
+
+	tg_req_free(req);
+}
+
+static void avrcp_handle_search(struct avrcp *session,
+				struct avrcp_browsing_header *pdu,
+				uint8_t transaction)
+{
+	uint16_t len = be16_to_cpu(pdu->param_len);
+	struct avrcp_player *player = session->tg_browsed;
+	struct tg_browse_req *req;
+	uint16_t charset, slen;
+	char *value;
+	int err;
+
+	if (len < 4) {
+		tg_browse_reject(pdu, AVRCP_STATUS_INVALID_PARAM);
+		return;
+	}
+
+	charset = get_be16(&pdu->params[0]);
+	slen = get_be16(&pdu->params[2]);
+
+	if (slen > len - 4 || charset != AVRCP_CHARSET_UTF8) {
+		tg_browse_reject(pdu, AVRCP_STATUS_INVALID_PARAM);
+		return;
+	}
+
+	if (!player) {
+		tg_browse_reject(pdu, AVRCP_STATUS_PLAYER_NOT_BROWSABLE);
+		return;
+	}
+
+	if (!tg_searchable(player) || !player->cb->search) {
+		tg_browse_reject(pdu, AVRCP_STATUS_SEARCH_NOT_SUPPORTED);
+		return;
+	}
+
+	value = g_strndup((const char *) &pdu->params[4], slen);
+	req = tg_req_new(session, player, pdu, transaction);
+
+	err = player->cb->search(value, tg_search_cb, req, player->user_data);
+	g_free(value);
+	if (err < 0) {
+		tg_req_free(req);
+		tg_browse_reject(pdu, err == -ENOTSUP ?
+					AVRCP_STATUS_SEARCH_NOT_SUPPORTED :
+					tg_status(err));
+		return;
+	}
+
+	session->tg_deferred = true;
+}
+
+/* PlayItem and AddToNowPlaying, on the control channel: the player is told,
+ * and the command accepted, at once.
+ */
+static uint8_t tg_handle_item(struct avrcp *session, struct avrcp_header *pdu,
+								bool play)
+{
+	uint16_t len = be16_to_cpu(pdu->params_len);
+	struct local_player_item *item;
+	struct avrcp_player *player;
+	const char *folder;
+	uint8_t status;
+	int err;
+
+	if (len < 11) {
+		status = AVRCP_STATUS_INVALID_PARAM;
+		goto err;
+	}
+
+	status = tg_scope(session, pdu->params[0], &player, &folder);
+	if (status != AVRCP_STATUS_SUCCESS)
+		goto err;
+
+	item = tg_item_find(player, get_be64(&pdu->params[1]));
+	if (!item) {
+		status = AVRCP_STATUS_DOES_NOT_EXIST;
+		goto err;
+	}
+
+	if (!strcmp(item->type, "folder") && !item->playable) {
+		status = AVRCP_STATUS_NOT_PLAYABLE;
+		goto err;
+	}
+
+	if (play)
+		err = player->cb->play_item ?
+			player->cb->play_item(item->path, player->user_data) :
+			-ENOTSUP;
+	else
+		err = player->cb->add_to_now_playing ?
+			player->cb->add_to_now_playing(item->path,
+							player->user_data) :
+			-ENOTSUP;
+	if (err < 0) {
+		status = err == -ENOTSUP ? AVRCP_STATUS_INVALID_COMMAND :
+						AVRCP_STATUS_INTERNAL_ERROR;
+		goto err;
+	}
+
+	pdu->params_len = cpu_to_be16(1);
+	pdu->params[0] = AVRCP_STATUS_SUCCESS;
+	return AVC_CTYPE_ACCEPTED;
+
+err:
+	pdu->params_len = cpu_to_be16(1);
+	pdu->params[0] = status;
+	return AVC_CTYPE_REJECTED;
+}
+
+static uint8_t avrcp_handle_play_item(struct avrcp *session,
+						struct avrcp_header *pdu,
+						uint8_t transaction)
+{
+	return tg_handle_item(session, pdu, true);
+}
+
+static uint8_t avrcp_handle_add_to_now_playing(struct avrcp *session,
+						struct avrcp_header *pdu,
+						uint8_t transaction)
+{
+	return tg_handle_item(session, pdu, false);
+}
+
 static const struct control_pdu_handler control_handlers[] = {
 		{ AVRCP_GET_CAPABILITIES, AVC_CTYPE_STATUS,
 					avrcp_handle_get_capabilities },
@@ -1901,6 +2836,10 @@ static const struct control_pdu_handler control_handlers[] = {
 					avrcp_handle_abort_continuing },
 		{ AVRCP_SET_ADDRESSED_PLAYER, AVC_CTYPE_CONTROL,
 					avrcp_handle_set_addressed_player },
+		{ AVRCP_PLAY_ITEM, AVC_CTYPE_CONTROL,
+					avrcp_handle_play_item },
+		{ AVRCP_ADD_TO_NOW_PLAYING, AVC_CTYPE_CONTROL,
+					avrcp_handle_add_to_now_playing },
 		{ },
 };
 
@@ -2010,6 +2949,15 @@ static void avrcp_handle_media_player_list(struct avrcp *session,
 		/* Assign Default Feature Bit Mask */
 		memcpy(&item->features, &default_features,
 					sizeof(default_features));
+		if (tg_browsable(player)) {
+			/* Browsing, AddToNowPlaying, UIDs unique */
+			item->features[7] |= (1 << 3) | (1 << 5) | (1 << 6);
+			if (player->cb->get_now_playing &&
+				player->cb->get_now_playing(player->user_data))
+				item->features[8] |= (1 << 1); /* NowPlaying */
+		}
+		if (tg_searchable(player))
+			item->features[7] |= (1 << 4); /* Searching */
 
 		item->charset = cpu_to_be16(AVRCP_CHARSET_UTF8);
 
@@ -2071,6 +3019,9 @@ static void avrcp_handle_get_folder_items(struct avrcp *session,
 	case AVRCP_SCOPE_MEDIA_PLAYER_VFS:
 	case AVRCP_SCOPE_SEARCH:
 	case AVRCP_SCOPE_NOW_PLAYING:
+		tg_get_folder_items(session, pdu, transaction, scope,
+							start_item, end_item);
+		break;
 	default:
 		status = AVRCP_STATUS_INVALID_SCOPE;
 		goto failed;
@@ -2103,7 +3054,10 @@ static void avrcp_handle_get_total_number_of_items(struct avrcp *session,
 	uint8_t scope;
 	uint8_t status = AVRCP_STATUS_SUCCESS;
 
-	if (be16_to_cpu(pdu->param_len) != 1) {
+	/* Only the scope, but BlueZ's own controller used to send 11 bytes:
+	 * taken as long as the scope is there.
+	 */
+	if (be16_to_cpu(pdu->param_len) < 1) {
 		status = AVRCP_STATUS_INVALID_PARAM;
 		goto failed;
 	}
@@ -2117,6 +3071,8 @@ static void avrcp_handle_get_total_number_of_items(struct avrcp *session,
 	case AVRCP_SCOPE_MEDIA_PLAYER_VFS:
 	case AVRCP_SCOPE_SEARCH:
 	case AVRCP_SCOPE_NOW_PLAYING:
+		tg_get_total_number_of_items(session, pdu, transaction, scope);
+		break;
 	default:
 		status = AVRCP_STATUS_INVALID_SCOPE;
 		goto failed;
@@ -2134,9 +3090,13 @@ static const struct browsing_pdu_handler {
 	void (*func) (struct avrcp *session, struct avrcp_browsing_header *pdu,
 							uint8_t transaction);
 } browsing_handlers[] = {
+		{ AVRCP_SET_BROWSED_PLAYER, avrcp_handle_set_browsed_player },
 		{ AVRCP_GET_FOLDER_ITEMS, avrcp_handle_get_folder_items },
+		{ AVRCP_CHANGE_PATH, avrcp_handle_change_path },
+		{ AVRCP_GET_ITEM_ATTRIBUTES, avrcp_handle_get_item_attributes },
 		{ AVRCP_GET_TOTAL_NUMBER_OF_ITEMS,
 				avrcp_handle_get_total_number_of_items },
+		{ AVRCP_SEARCH, avrcp_handle_search },
 		{ },
 };
 
@@ -2173,7 +3133,15 @@ static size_t handle_browsing_pdu(struct avctp *conn,
 
 done:
 	session->transaction = transaction;
+	session->tg_deferred = false;
 	handler->func(session, pdu, transaction);
+
+	/* Asked the player: answered from its reply */
+	if (session->tg_deferred) {
+		session->tg_deferred = false;
+		return 0;
+	}
+
 	return AVRCP_BROWSING_HEADER_LENGTH + be16_to_cpu(pdu->param_len);
 }
 
@@ -3707,6 +4675,8 @@ static void player_destroy(gpointer data)
 	g_free(player->path);
 	g_free(player->change_path);
 	free(player->features);
+	g_slist_free_full(player->tg_reqs, tg_req_orphan_player);
+	tg_items_free(player);
 	g_free(player);
 }
 
@@ -4340,7 +5310,8 @@ static void target_init(struct avrcp *session)
 
 	session->supported_events |=
 				(1 << AVRCP_EVENT_ADDRESSED_PLAYER_CHANGED) |
-				(1 << AVRCP_EVENT_AVAILABLE_PLAYERS_CHANGED);
+				(1 << AVRCP_EVENT_AVAILABLE_PLAYERS_CHANGED) |
+				(1 << AVRCP_EVENT_NOW_PLAYING_CHANGED);
 
 	/* Only check capabilities if controller is not supported */
 	if (session->controller == NULL)
@@ -4450,6 +5421,10 @@ static void session_destroy(struct avrcp *session, int err)
 	server->sessions = g_slist_remove(server->sessions, session);
 
 	session_abort_pending_pdu(session);
+
+	g_slist_free_full(session->tg_reqs, tg_req_orphan_session);
+	session->tg_reqs = NULL;
+	tg_browse_reset(session);
 
 	service = btd_device_get_service(session->dev, AVRCP_TARGET_UUID);
 	if (service != NULL) {
@@ -4641,6 +5616,13 @@ void avrcp_unregister_player(struct avrcp_player *player)
 	GSList *l;
 
 	server->players = g_slist_remove(server->players, player);
+
+	for (l = server->sessions; l; l = l->next) {
+		struct avrcp *session = l->data;
+
+		if (session->tg_browsed == player)
+			tg_browse_reset(session);
+	}
 
 	/* Remove player from sessions using it */
 	for (l = player->sessions; l; l = l->next) {

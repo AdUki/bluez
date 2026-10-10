@@ -65,6 +65,14 @@
 #define AVRCP_EVENT_VOLUME_CHANGED		0x0d
 #define AVRCP_EVENT_LAST			AVRCP_EVENT_VOLUME_CHANGED
 
+/* The browsing answers, as media.h's local_player_*_cb (items: a list of
+ * struct local_player_item)
+ */
+typedef void (*avrcp_folder_cb)(int err, uint32_t num_items, void *user_data);
+typedef void (*avrcp_items_cb)(int err, GSList *items, void *user_data);
+typedef void (*avrcp_search_cb)(int err, const char *folder,
+					uint32_t num_items, void *user_data);
+
 struct avrcp_player_cb {
 	GList *(*list_settings)(void *user_data);
 	const char *(*get_setting)(const char *key, void *user_data);
@@ -82,6 +90,27 @@ struct avrcp_player_cb {
 	bool (*pause)(void *user_data);
 	bool (*next)(void *user_data);
 	bool (*previous)(void *user_data);
+
+	/*
+	 * Browsing (optional; without them the player is not browsable). The
+	 * folders are named by the paths these return and the items list;
+	 * see local_player_change_folder() and the rest in media.h, which
+	 * these follow.
+	 */
+	bool (*browsable)(void *user_data);
+	bool (*searchable)(void *user_data);
+	const char *(*get_root)(void *user_data);
+	const char *(*get_now_playing)(void *user_data);
+	int (*change_folder)(const char *folder,
+				avrcp_folder_cb cb, void *cb_data,
+				void *user_data);
+	int (*list_items)(const char *folder, uint32_t start, uint32_t end,
+				avrcp_items_cb cb, void *cb_data,
+				void *user_data);
+	int (*search)(const char *value, avrcp_search_cb cb,
+				void *cb_data, void *user_data);
+	int (*play_item)(const char *item, void *user_data);
+	int (*add_to_now_playing)(const char *item, void *user_data);
 };
 
 int avrcp_set_volume(struct btd_device *dev, int8_t volume, bool notify);
