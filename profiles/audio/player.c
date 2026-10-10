@@ -1885,8 +1885,19 @@ static struct media_item *media_folder_create_item(struct media_player *mp,
 	const char *strtype;
 
 	item = media_folder_find_item(folder, uid);
-	if (item != NULL)
+	if (item != NULL) {
+		/* A now playing item made from a track change has no name
+		 * yet: the listing that finds it again has one.
+		 */
+		if (name && g_strcmp0(item->name, name)) {
+			g_free(item->name);
+			item->name = g_strdup(name);
+			g_dbus_emit_property_changed(btd_get_dbus_connection(),
+						item->path, MEDIA_ITEM_INTERFACE,
+						"Name");
+		}
 		return item;
+	}
 
 	strtype = type_to_string(type);
 	if (strtype == NULL)
