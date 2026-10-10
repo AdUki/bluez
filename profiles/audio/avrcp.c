@@ -2933,7 +2933,10 @@ static void avrcp_handle_media_player_list(struct avrcp *session,
 		struct player_item *item;
 		uint16_t namelen;
 
-		if (rsp->num_items == (end_item - start_item) + 1)
+		/* 64 bits: 0 to 0xffffffff, which controllers ask for, is
+		 * 2^32 items
+		 */
+		if (rsp->num_items == (uint64_t) end_item - start_item + 1)
 			break;
 
 		folder = (void *)&pdu->params[pdu->param_len];
