@@ -7480,12 +7480,15 @@ static bool is_filter_match(GSList *discovery_filter, struct eir_data *eir_data,
 		}
 
 		if (got_match) {
-			/* we have service match, check proximity */
-			if (item->rssi == DISTANCE_VAL_INVALID ||
-			    item->rssi <= rssi ||
-			    item->pathloss == DISTANCE_VAL_INVALID ||
-			    (eir_data->tx_power != 127 &&
-			     eir_data->tx_power - rssi <= item->pathloss))
+			/* we have service match, check proximity: each
+			 * threshold a filter sets has to hold, and a path loss
+			 * needs the TX power the device advertises
+			 */
+			if ((item->rssi == DISTANCE_VAL_INVALID ||
+			     item->rssi <= rssi) &&
+			    (item->pathloss == DISTANCE_VAL_INVALID ||
+			     (eir_data->tx_power != 127 &&
+			      eir_data->tx_power - rssi <= item->pathloss)))
 				return true;
 
 			got_match = false;
