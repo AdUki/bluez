@@ -686,11 +686,10 @@ static int avctp_send(struct avctp_channel *control, uint8_t transaction,
 	return err;
 }
 
-static int avctp_browsing_send(struct avctp_queue *queue,
+static int browsing_send(struct avctp_channel *browsing,
 				uint8_t transaction, uint8_t cr,
 				uint8_t *operands, size_t operand_count)
 {
-	struct avctp_channel *browsing = queue->chan;
 	struct avctp_header *avctp;
 	struct msghdr msg;
 	struct iovec iov[2];
@@ -723,6 +722,14 @@ static int avctp_browsing_send(struct avctp_queue *queue,
 		err = -errno;
 
 	return err;
+}
+
+static int avctp_browsing_send(struct avctp_queue *queue,
+				uint8_t transaction, uint8_t cr,
+				uint8_t *operands, size_t operand_count)
+{
+	return browsing_send(queue->chan, transaction, cr, operands,
+							operand_count);
 }
 
 static void control_req_destroy(void *data)
@@ -1016,9 +1023,16 @@ static gboolean session_browsing_cb(GIOChannel *chan, GIOCondition cond,
 		goto send;
 	}
 
-	packet_size += handler->cb(session, avctp->transaction,
-						operands, operand_count,
-						handler->user_data);
+	ret = handler->cb(session, avctp->transaction, operands,
+					operand_count, handler->user_data);
+
+	/* A handler that has to ask someone first (the target's media player)
+	 * answers later, with avctp_send_browsing_rsp().
+	 */
+	if (ret == 0)
+		return TRUE;
+
+	packet_size += ret;
 
 send:
 	if (packet_size != 0) {
@@ -1664,6 +1678,30 @@ static int avctp_send_req(struct avctp *session, uint8_t code,
 		queue->process_id = g_idle_add(process_queue, queue);
 
 	return 0;
+}
+
+/* The largest browsing PDU the remote takes, without the AVCTP header. */
+uint16_t avctp_get_browsing_mtu(struct avctp *session)
+{
+	struct avctp_channel *browsing = session->browsing;
+
+	if (browsing == NULL || browsing->omtu <= AVCTP_HEADER_LENGTH)
+		return 0;
+
+	return browsing->omtu - AVCTP_HEADER_LENGTH;
+}
+
+/* The response to a browsing command whose handler returned 0. */
+int avctp_send_browsing_rsp(struct avctp *session, uint8_t transaction,
+				uint8_t *operands, size_t operand_count)
+{
+	struct avctp_channel *browsing = session->browsing;
+
+	if (browsing == NULL || browsing->watch == 0)
+		return -ENOTCONN;
+
+	return browsing_send(browsing, transaction, AVCTP_RESPONSE, operands,
+							operand_count);
 }
 
 int avctp_send_browsing_req(struct avctp *session,

@@ -136,6 +136,7 @@ typedef gboolean (*avctp_rsp_cb) (struct avctp *session, uint8_t code,
 typedef gboolean (*avctp_browsing_rsp_cb) (struct avctp *session,
 					uint8_t *operands, size_t operand_count,
 					void *user_data);
+/* 0: no response now, the handler sends it with avctp_send_browsing_rsp() */
 typedef size_t (*avctp_browsing_pdu_cb) (struct avctp *session,
 					uint8_t transaction,
 					uint8_t *operands, size_t operand_count,
@@ -180,6 +181,9 @@ int avctp_send_vendordep_req(struct avctp *session, uint8_t code,
 					uint8_t subunit, uint8_t *operands,
 					size_t operand_count,
 					avctp_rsp_cb func, void *user_data);
+uint16_t avctp_get_browsing_mtu(struct avctp *session);
+int avctp_send_browsing_rsp(struct avctp *session, uint8_t transaction,
+				uint8_t *operands, size_t operand_count);
 int avctp_send_browsing_req(struct avctp *session,
 				uint8_t *operands, size_t operand_count,
 				avctp_browsing_rsp_cb func, void *user_data);
