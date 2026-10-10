@@ -579,6 +579,8 @@ static unsigned int attr_get_max_val(uint8_t attr)
 	return 0;
 }
 
+static uint64_t player_get_uid(struct avrcp_player *player);
+
 static const char *battery_status_to_str(uint8_t status)
 {
 	switch (status) {
@@ -806,8 +808,9 @@ void avrcp_player_event(struct avrcp_player *player, uint8_t id,
 
 		break;
 	case AVRCP_EVENT_TRACK_CHANGED:
+		/* The Identifier is big endian, like every AVRCP number */
 		size = 9;
-		memcpy(&pdu->params[1], data, sizeof(uint64_t));
+		put_be64(player_get_uid(player), &pdu->params[1]);
 
 		break;
 	case AVRCP_EVENT_TRACK_REACHED_END:
@@ -1512,12 +1515,23 @@ static uint8_t avrcp_handle_get_play_status(struct avrcp *session,
 	return AVC_CTYPE_STABLE;
 }
 
+static uint64_t tg_track_uid(struct avrcp_player *player);
+
+/* The current track's: UINT64_MAX for none, its item's UID for a browsable
+ * player that says which item it is, 0 (selected, not browsable) otherwise.
+ */
 static uint64_t player_get_uid(struct avrcp_player *player)
 {
+	uint64_t uid;
+
 	if (player == NULL)
 		return UINT64_MAX;
 
-	return player->cb->get_uid(player->user_data);
+	uid = player->cb->get_uid(player->user_data);
+	if (uid == UINT64_MAX)
+		return uid;
+
+	return tg_track_uid(player);
 }
 
 static GList *player_list_settings(struct avrcp_player *player)
@@ -1646,7 +1660,7 @@ static uint8_t avrcp_handle_register_notification(struct avrcp *session,
 	case AVRCP_EVENT_TRACK_CHANGED:
 		len = 9;
 		uid = player_get_uid(player);
-		memcpy(&pdu->params[1], &uid, sizeof(uint64_t));
+		put_be64(uid, &pdu->params[1]);
 
 		break;
 	case AVRCP_EVENT_TRACK_REACHED_END:
@@ -1994,6 +2008,51 @@ static struct local_player_item *tg_item_find(struct avrcp_player *player,
 	t = g_hash_table_lookup(player->tg_uids, &uid);
 
 	return t ? t->item : NULL;
+}
+
+/* The UID of the track playing, an item of the library: the one it was
+ * listed with, or a new one (with what the track's metadata says of it, for
+ * GetItemAttributes) when it was not listed yet. 0 for a player that is not
+ * browsable or does not say which item it plays.
+ */
+static uint64_t tg_track_uid(struct avrcp_player *player)
+{
+	struct local_player_item *item;
+	const char *path, *title;
+	GList *keys, *l;
+	struct tg_item *t;
+
+	if (!tg_browsable(player) || !player->cb->get_track)
+		return 0;
+
+	path = player->cb->get_track(player->user_data);
+	if (!path)
+		return 0;
+
+	t = player->tg_items ? g_hash_table_lookup(player->tg_items, path) :
+									NULL;
+	if (t)
+		return t->uid;
+
+	item = g_new0(struct local_player_item, 1);
+	item->path = g_strdup(path);
+	item->type = g_strdup("audio");
+	item->metadata = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+								g_free);
+	keys = player->cb->list_metadata(player->user_data);
+	for (l = keys; l; l = l->next) {
+		const char *v = player->cb->get_metadata(l->data,
+							player->user_data);
+
+		if (v)
+			g_hash_table_insert(item->metadata, g_strdup(l->data),
+								g_strdup(v));
+	}
+	g_list_free(keys);
+	title = g_hash_table_lookup(item->metadata, "Title");
+	item->name = g_strdup(title ? title : "");
+
+	return tg_item_add(player, item);
 }
 
 static void tg_items_free(struct avrcp_player *player)

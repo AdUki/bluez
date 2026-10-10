@@ -167,6 +167,13 @@ static const char *lp_get_now_playing(void *user_data)
 	return local_player_get_playlist(p->lp);
 }
 
+static const char *lp_get_track(void *user_data)
+{
+	struct player_link *p = user_data;
+
+	return local_player_get_track(p->lp);
+}
+
 static int lp_change_folder(const char *folder, avrcp_folder_cb cb,
 					void *cb_data, void *user_data)
 {
@@ -226,6 +233,7 @@ static struct avrcp_player_cb avrcp_cb = {
 	.searchable = lp_searchable,
 	.get_root = lp_get_root,
 	.get_now_playing = lp_get_now_playing,
+	.get_track = lp_get_track,
 	.change_folder = lp_change_folder,
 	.list_items = lp_list_items,
 	.search = lp_search,
@@ -275,9 +283,9 @@ static void track_position(uint32_t old, uint32_t position, void *user_data)
 static void track_changed(void *user_data)
 {
 	struct player_link *p = user_data;
-	uint64_t uid = lp_get_uid(p);
 
-	avrcp_player_event(p->avrcp, AVRCP_EVENT_TRACK_CHANGED, &uid);
+	/* The UID is the target's to tell: the track's item's, if browsing */
+	avrcp_player_event(p->avrcp, AVRCP_EVENT_TRACK_CHANGED, NULL);
 	avrcp_player_event(p->avrcp, AVRCP_EVENT_TRACK_REACHED_START, NULL);
 }
 

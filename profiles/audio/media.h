@@ -119,6 +119,8 @@ const char *local_player_get_path(struct local_player *lp);
 bool local_player_browsable(struct local_player *lp);
 bool local_player_searchable(struct local_player *lp);
 const char *local_player_get_playlist(struct local_player *lp);
+/* The current track's object, from its metadata's mpris:trackid (NULL if none) */
+const char *local_player_get_track(struct local_player *lp);
 
 int local_player_change_folder(struct local_player *lp, const char *folder,
 				local_player_folder_cb cb, void *user_data);

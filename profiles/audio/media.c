@@ -173,6 +173,7 @@ struct local_player {
 	bool			browsable;
 	bool			searchable;
 	char			*playlist;	/* Now playing folder */
+	char			*trackid;	/* The track's object */
 	char			*folder;	/* Its current folder */
 	struct queue		*browse_ops;	/* Head: the one running */
 };
@@ -2198,6 +2199,7 @@ static void local_player_destroy(struct local_player *mp)
 	g_free(mp->status);
 	g_free(mp->name);
 	g_free(mp->playlist);
+	g_free(mp->trackid);
 	g_free(mp->folder);
 	queue_destroy(mp->browse_ops, browse_op_free_cb);
 	g_free(mp);
@@ -2542,6 +2544,11 @@ bool local_player_searchable(struct local_player *mp)
 const char *local_player_get_playlist(struct local_player *mp)
 {
 	return mp->playlist;
+}
+
+const char *local_player_get_track(struct local_player *mp)
+{
+	return mp->trackid;
 }
 
 static void browse_op_free(struct browse_op *op)
@@ -3293,6 +3300,8 @@ static gboolean parse_player_metadata(struct local_player *mp,
 
 	mp->track = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
 								g_free);
+	g_free(mp->trackid);
+	mp->trackid = NULL;
 
 	while ((ctype = dbus_message_iter_get_arg_type(&dict)) !=
 							DBUS_TYPE_INVALID) {
@@ -3333,6 +3342,15 @@ static gboolean parse_player_metadata(struct local_player *mp,
 		} else if (strcasecmp(key, "xesam:trackNumber") == 0) {
 			if (!parse_int32_metadata(mp, "TrackNumber", &var))
 				return FALSE;
+		} else if (strcasecmp(key, "mpris:trackid") == 0) {
+			const char *path;
+
+			/* The track's item, for its UID when browsing */
+			if (dbus_message_iter_get_arg_type(&var) !=
+							DBUS_TYPE_OBJECT_PATH)
+				return FALSE;
+			dbus_message_iter_get_basic(&var, &path);
+			mp->trackid = g_strdup(path);
 		} else
 			DBG("%s not supported, ignoring", key);
 

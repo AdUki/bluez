@@ -101,6 +101,8 @@ struct avrcp_player_cb {
 	bool (*searchable)(void *user_data);
 	const char *(*get_root)(void *user_data);
 	const char *(*get_now_playing)(void *user_data);
+	/* The current track's item (NULL: none, or not one of the library) */
+	const char *(*get_track)(void *user_data);
 	int (*change_folder)(const char *folder,
 				avrcp_folder_cb cb, void *cb_data,
 				void *user_data);
