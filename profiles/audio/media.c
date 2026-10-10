@@ -73,6 +73,9 @@
 #define MEDIA_INTERFACE "org.bluez.Media1"
 #define MEDIA_ENDPOINT_INTERFACE "org.bluez.MediaEndpoint1"
 #define MEDIA_PLAYER_INTERFACE "org.mpris.MediaPlayer2.Player"
+#define MEDIA_FOLDER_INTERFACE "org.bluez.MediaFolder1"
+#define MEDIA_ITEM_INTERFACE "org.bluez.MediaItem1"
+#define BROWSE_TIMEOUT 5000
 
 /* Timeout should be less than avdtp request timeout (4 seconds) */
 #define A2DP_REQUEST_TIMEOUT_MSEC	(3 * 1000)
@@ -167,6 +170,11 @@ struct local_player {
 	bool			control;
 	char			*name;
 	struct queue		*cbs;
+	bool			browsable;
+	bool			searchable;
+	char			*playlist;	/* Now playing folder */
+	char			*folder;	/* Its current folder */
+	struct queue		*browse_ops;	/* Head: the one running */
 };
 
 struct local_player_watch {
@@ -2122,6 +2130,11 @@ static void local_player_emit_settings_changed(struct local_player *mp,
 	LOCAL_PLAYER_EMIT_CB(mp, settings_changed, key, cbs->user_data);
 }
 
+static void local_player_emit_now_playing_changed(struct local_player *mp)
+{
+	LOCAL_PLAYER_EMIT_CB(mp, now_playing_changed, cbs->user_data);
+}
+
 static void local_player_emit_player_removed(struct local_player *mp)
 {
 	LOCAL_PLAYER_EMIT_CB(mp, player_removed, cbs->user_data);
@@ -2141,12 +2154,25 @@ static void local_player_emit_player_added(struct local_player *mp)
 	}
 }
 
+static void browse_cancel(void *data);
+static void browse_op_free_cb(void *data);
+
 static void local_player_destroy(struct local_player *mp)
 {
 	DBusConnection *conn = btd_get_dbus_connection();
 	struct media_adapter *adapter = mp->adapter;
 
 	DBG("sender=%s path=%s", mp->sender, mp->path);
+
+	/* Answered before the player is gone, while the ones who asked
+	 * still know it.
+	 */
+	if (mp->browse_ops) {
+		struct queue *ops = mp->browse_ops;
+
+		mp->browse_ops = queue_new();
+		queue_destroy(ops, browse_cancel);
+	}
 
 	local_player_emit_player_removed(mp);
 
@@ -2171,6 +2197,9 @@ static void local_player_destroy(struct local_player *mp)
 	g_free(mp->path);
 	g_free(mp->status);
 	g_free(mp->name);
+	g_free(mp->playlist);
+	g_free(mp->folder);
+	queue_destroy(mp->browse_ops, browse_op_free_cb);
 	g_free(mp);
 }
 
@@ -2437,6 +2466,663 @@ bool local_player_previous(struct local_player *mp)
 struct btd_adapter *local_player_get_adapter(struct local_player *mp)
 {
 	return mp->adapter->btd_adapter;
+}
+
+/*
+ * Browsing (target role, see media.h). Each request is a short chain of calls
+ * to the player: a Search (search only), a ChangeFolder when the player's
+ * current folder is not the one the request is about, then ListItems or the
+ * folder's NumberOfItems. The requests are queued and run one at a time, since
+ * the current folder is shared: two of them interleaved would list each
+ * other's folders.
+ */
+enum browse_op_type {
+	BROWSE_CHANGE_FOLDER,
+	BROWSE_LIST_ITEMS,
+	BROWSE_SEARCH,
+};
+
+enum browse_op_state {
+	BROWSE_STATE_QUEUED,
+	BROWSE_STATE_SEARCH,
+	BROWSE_STATE_CHANGE,
+	BROWSE_STATE_WORK,
+};
+
+struct browse_op {
+	struct local_player *mp;
+	enum browse_op_type type;
+	enum browse_op_state state;
+	char *folder;
+	char *value;
+	uint32_t start;
+	uint32_t end;
+	DBusPendingCall *call;
+	union {
+		local_player_folder_cb folder;
+		local_player_items_cb items;
+		local_player_search_cb search;
+	} cb;
+	void *user_data;
+};
+
+static void browse_run(struct local_player *mp);
+
+void local_player_item_free(void *data)
+{
+	struct local_player_item *item = data;
+
+	if (!item)
+		return;
+
+	g_free(item->path);
+	g_free(item->name);
+	g_free(item->type);
+	g_free(item->folder_type);
+	if (item->metadata)
+		g_hash_table_unref(item->metadata);
+	g_free(item);
+}
+
+const char *local_player_get_path(struct local_player *mp)
+{
+	return mp->path;
+}
+
+bool local_player_browsable(struct local_player *mp)
+{
+	return mp->browsable;
+}
+
+bool local_player_searchable(struct local_player *mp)
+{
+	return mp->searchable;
+}
+
+const char *local_player_get_playlist(struct local_player *mp)
+{
+	return mp->playlist;
+}
+
+static void browse_op_free(struct browse_op *op)
+{
+	if (op->call) {
+		dbus_pending_call_cancel(op->call);
+		dbus_pending_call_unref(op->call);
+	}
+
+	g_free(op->folder);
+	g_free(op->value);
+	g_free(op);
+}
+
+/* Answers the request and starts the next one. */
+static void browse_finish(struct browse_op *op, int err, uint32_t num_items,
+								GSList *items)
+{
+	struct local_player *mp = op->mp;
+
+	queue_remove(mp->browse_ops, op);
+
+	switch (op->type) {
+	case BROWSE_CHANGE_FOLDER:
+		op->cb.folder(err, num_items, op->user_data);
+		break;
+	case BROWSE_LIST_ITEMS:
+		op->cb.items(err, items, op->user_data);
+		break;
+	case BROWSE_SEARCH:
+		op->cb.search(err, err ? NULL : op->folder, num_items,
+							op->user_data);
+		break;
+	}
+
+	browse_op_free(op);
+
+	/* The callback may have queued another request, or the player may be
+	 * gone with the last one (local_player_destroy cancels the rest).
+	 */
+	browse_run(mp);
+}
+
+static int browse_error(DBusMessage *reply)
+{
+	DBusError derr;
+	int err = -EIO;
+
+	dbus_error_init(&derr);
+
+	if (!dbus_set_error_from_message(&derr, reply))
+		return 0;
+
+	DBG("%s: %s", derr.name, derr.message);
+
+	if (g_str_has_suffix(derr.name, ".NotSupported") ||
+			!strcmp(derr.name, DBUS_ERROR_UNKNOWN_METHOD) ||
+			!strcmp(derr.name, DBUS_ERROR_UNKNOWN_INTERFACE))
+		err = -ENOTSUP;
+	else if (g_str_has_suffix(derr.name, ".DoesNotExist") ||
+			g_str_has_suffix(derr.name, ".InvalidArguments") ||
+			!strcmp(derr.name, DBUS_ERROR_UNKNOWN_OBJECT))
+		err = -ENOENT;
+
+	dbus_error_free(&derr);
+
+	return err;
+}
+
+static void browse_reply(DBusPendingCall *call, void *user_data);
+
+static int browse_send(struct browse_op *op, DBusMessage *msg)
+{
+	DBusConnection *conn = btd_get_dbus_connection();
+
+	if (!msg)
+		return -ENOMEM;
+
+	if (!g_dbus_send_message_with_reply(conn, msg, &op->call,
+							BROWSE_TIMEOUT)) {
+		dbus_message_unref(msg);
+		return -EIO;
+	}
+
+	dbus_pending_call_set_notify(op->call, browse_reply, op, NULL);
+	dbus_message_unref(msg);
+
+	return 0;
+}
+
+static void append_range(DBusMessageIter *iter, uint32_t start, uint32_t end)
+{
+	DBusMessageIter dict;
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_ARRAY,
+					DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING
+					DBUS_TYPE_STRING_AS_STRING
+					DBUS_TYPE_VARIANT_AS_STRING
+					DBUS_DICT_ENTRY_END_CHAR_AS_STRING,
+					&dict);
+	g_dbus_dict_append_entry(&dict, "Start", DBUS_TYPE_UINT32, &start);
+	g_dbus_dict_append_entry(&dict, "End", DBUS_TYPE_UINT32, &end);
+	dbus_message_iter_close_container(iter, &dict);
+}
+
+/* Sends the call for the step the request is at. */
+static int browse_step(struct browse_op *op)
+{
+	struct local_player *mp = op->mp;
+	DBusMessage *msg;
+	DBusMessageIter iter;
+	const char *iface = MEDIA_FOLDER_INTERFACE;
+	const char *prop = "NumberOfItems";
+
+	switch (op->state) {
+	case BROWSE_STATE_QUEUED:
+	case BROWSE_STATE_SEARCH:
+		/* Not a step of its own: see browse_run */
+		return -EINVAL;
+	case BROWSE_STATE_CHANGE:
+		if (!g_strcmp0(mp->folder, op->folder)) {
+			op->state = BROWSE_STATE_WORK;
+			return browse_step(op);
+		}
+
+		msg = dbus_message_new_method_call(mp->sender, mp->path,
+						MEDIA_FOLDER_INTERFACE,
+						"ChangeFolder");
+		if (msg)
+			dbus_message_append_args(msg, DBUS_TYPE_OBJECT_PATH,
+						&op->folder, DBUS_TYPE_INVALID);
+		return browse_send(op, msg);
+	case BROWSE_STATE_WORK:
+		if (op->type == BROWSE_LIST_ITEMS) {
+			msg = dbus_message_new_method_call(mp->sender, mp->path,
+						MEDIA_FOLDER_INTERFACE,
+						"ListItems");
+			if (msg) {
+				dbus_message_iter_init_append(msg, &iter);
+				append_range(&iter, op->start, op->end);
+			}
+			return browse_send(op, msg);
+		}
+
+		msg = dbus_message_new_method_call(mp->sender, mp->path,
+						DBUS_INTERFACE_PROPERTIES,
+						"Get");
+		if (msg)
+			dbus_message_append_args(msg, DBUS_TYPE_STRING, &iface,
+						DBUS_TYPE_STRING, &prop,
+						DBUS_TYPE_INVALID);
+		return browse_send(op, msg);
+	}
+
+	return -EINVAL;
+}
+
+static void browse_run(struct local_player *mp)
+{
+	struct browse_op *op = queue_peek_head(mp->browse_ops);
+	DBusMessage *msg;
+	DBusMessageIter iter, dict;
+	int err;
+
+	if (!op || op->state != BROWSE_STATE_QUEUED)
+		return;
+
+	if (op->type == BROWSE_SEARCH) {
+		op->state = BROWSE_STATE_SEARCH;
+		msg = dbus_message_new_method_call(mp->sender, mp->path,
+						MEDIA_FOLDER_INTERFACE,
+						"Search");
+		if (msg) {
+			dbus_message_iter_init_append(msg, &iter);
+			dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING,
+								&op->value);
+			dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY,
+					DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING
+					DBUS_TYPE_STRING_AS_STRING
+					DBUS_TYPE_VARIANT_AS_STRING
+					DBUS_DICT_ENTRY_END_CHAR_AS_STRING,
+					&dict);
+			dbus_message_iter_close_container(&iter, &dict);
+		}
+		err = browse_send(op, msg);
+	} else {
+		op->state = BROWSE_STATE_CHANGE;
+		err = browse_step(op);
+	}
+
+	if (err < 0)
+		browse_finish(op, err, 0, NULL);
+}
+
+static char *metadata_string(DBusMessageIter *var)
+{
+	DBusMessageIter array;
+	const char *str;
+	uint32_t u;
+
+	switch (dbus_message_iter_get_arg_type(var)) {
+	case DBUS_TYPE_STRING:
+		dbus_message_iter_get_basic(var, &str);
+		return g_strdup(str);
+	case DBUS_TYPE_UINT32:
+		dbus_message_iter_get_basic(var, &u);
+		return g_strdup_printf("%u", u);
+	case DBUS_TYPE_ARRAY:
+		/* MPRIS style: the first of a list of strings */
+		dbus_message_iter_recurse(var, &array);
+		if (dbus_message_iter_get_arg_type(&array) != DBUS_TYPE_STRING)
+			return NULL;
+		dbus_message_iter_get_basic(&array, &str);
+		return g_strdup(str);
+	}
+
+	return NULL;
+}
+
+static GHashTable *parse_item_metadata(DBusMessageIter *var)
+{
+	GHashTable *md = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+								g_free);
+	DBusMessageIter dict;
+
+	if (dbus_message_iter_get_arg_type(var) != DBUS_TYPE_ARRAY)
+		return md;
+
+	dbus_message_iter_recurse(var, &dict);
+
+	while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
+		DBusMessageIter entry, value;
+		const char *key;
+		char *str;
+
+		dbus_message_iter_recurse(&dict, &entry);
+		dbus_message_iter_get_basic(&entry, &key);
+		dbus_message_iter_next(&entry);
+		dbus_message_iter_recurse(&entry, &value);
+
+		/* MediaItem1's Number is the track's TrackNumber */
+		if (!strcmp(key, "Number"))
+			key = "TrackNumber";
+
+		str = metadata_string(&value);
+		if (str)
+			g_hash_table_replace(md, g_strdup(key), str);
+
+		dbus_message_iter_next(&dict);
+	}
+
+	return md;
+}
+
+static struct local_player_item *parse_item(const char *path,
+							DBusMessageIter *props)
+{
+	struct local_player_item *item = g_new0(struct local_player_item, 1);
+	DBusMessageIter dict;
+
+	item->path = g_strdup(path);
+
+	dbus_message_iter_recurse(props, &dict);
+
+	while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
+		DBusMessageIter entry, var;
+		const char *key, *str;
+		dbus_bool_t b;
+		int type;
+
+		dbus_message_iter_recurse(&dict, &entry);
+		dbus_message_iter_get_basic(&entry, &key);
+		dbus_message_iter_next(&entry);
+		dbus_message_iter_recurse(&entry, &var);
+		type = dbus_message_iter_get_arg_type(&var);
+
+		if (type == DBUS_TYPE_STRING) {
+			dbus_message_iter_get_basic(&var, &str);
+			if (!strcmp(key, "Name")) {
+				g_free(item->name);
+				item->name = g_strdup(str);
+			} else if (!strcmp(key, "Type")) {
+				g_free(item->type);
+				item->type = g_ascii_strdown(str, -1);
+			} else if (!strcmp(key, "FolderType")) {
+				g_free(item->folder_type);
+				item->folder_type = g_ascii_strdown(str, -1);
+			}
+		} else if (type == DBUS_TYPE_BOOLEAN &&
+					!strcmp(key, "Playable")) {
+			dbus_message_iter_get_basic(&var, &b);
+			item->playable = b;
+		} else if (!strcmp(key, "Metadata")) {
+			if (item->metadata)
+				g_hash_table_unref(item->metadata);
+			item->metadata = parse_item_metadata(&var);
+		}
+
+		dbus_message_iter_next(&dict);
+	}
+
+	if (!item->type)
+		item->type = g_strdup("audio");
+	if (!item->metadata)
+		item->metadata = g_hash_table_new_full(g_str_hash, g_str_equal,
+							g_free, g_free);
+	if (!item->name) {
+		const char *title = g_hash_table_lookup(item->metadata,
+								"Title");
+
+		item->name = g_strdup(title ? title : "");
+	}
+
+	return item;
+}
+
+static int parse_items(DBusMessage *reply, GSList **items)
+{
+	DBusMessageIter iter, array;
+
+	*items = NULL;
+
+	if (!dbus_message_iter_init(reply, &iter) ||
+			dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_ARRAY)
+		return -EINVAL;
+
+	dbus_message_iter_recurse(&iter, &array);
+
+	while (dbus_message_iter_get_arg_type(&array) == DBUS_TYPE_DICT_ENTRY) {
+		DBusMessageIter entry;
+		const char *path;
+
+		dbus_message_iter_recurse(&array, &entry);
+		if (dbus_message_iter_get_arg_type(&entry) !=
+							DBUS_TYPE_OBJECT_PATH)
+			goto fail;
+		dbus_message_iter_get_basic(&entry, &path);
+		dbus_message_iter_next(&entry);
+		if (dbus_message_iter_get_arg_type(&entry) != DBUS_TYPE_ARRAY)
+			goto fail;
+
+		*items = g_slist_prepend(*items, parse_item(path, &entry));
+		dbus_message_iter_next(&array);
+	}
+
+	*items = g_slist_reverse(*items);
+
+	return 0;
+
+fail:
+	g_slist_free_full(*items, local_player_item_free);
+	*items = NULL;
+
+	return -EINVAL;
+}
+
+static int parse_num_items(DBusMessage *reply, uint32_t *num)
+{
+	DBusMessageIter iter, var;
+
+	if (!dbus_message_iter_init(reply, &iter) ||
+			dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_VARIANT)
+		return -EINVAL;
+
+	dbus_message_iter_recurse(&iter, &var);
+	if (dbus_message_iter_get_arg_type(&var) != DBUS_TYPE_UINT32)
+		return -EINVAL;
+
+	dbus_message_iter_get_basic(&var, num);
+
+	return 0;
+}
+
+static void browse_reply(DBusPendingCall *call, void *user_data)
+{
+	struct browse_op *op = user_data;
+	struct local_player *mp = op->mp;
+	DBusMessage *reply = dbus_pending_call_steal_reply(call);
+	const char *path;
+	GSList *items;
+	uint32_t num = 0;
+	int err;
+
+	dbus_pending_call_unref(op->call);
+	op->call = NULL;
+
+	err = browse_error(reply);
+	if (err < 0) {
+		/* Where a failed ChangeFolder left the player is not known */
+		if (op->state == BROWSE_STATE_CHANGE) {
+			g_free(mp->folder);
+			mp->folder = NULL;
+		}
+		goto done;
+	}
+
+	switch (op->state) {
+	case BROWSE_STATE_QUEUED:
+		err = -EINVAL;
+		break;
+	case BROWSE_STATE_SEARCH:
+		if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_OBJECT_PATH,
+						&path, DBUS_TYPE_INVALID)) {
+			err = -EINVAL;
+			break;
+		}
+
+		g_free(op->folder);
+		op->folder = g_strdup(path);
+		op->state = BROWSE_STATE_CHANGE;
+		err = browse_step(op);
+		if (!err) {
+			dbus_message_unref(reply);
+			return;
+		}
+		break;
+	case BROWSE_STATE_CHANGE:
+		g_free(mp->folder);
+		mp->folder = g_strdup(op->folder);
+		op->state = BROWSE_STATE_WORK;
+		err = browse_step(op);
+		if (!err) {
+			dbus_message_unref(reply);
+			return;
+		}
+		break;
+	case BROWSE_STATE_WORK:
+		if (op->type == BROWSE_LIST_ITEMS) {
+			err = parse_items(reply, &items);
+			if (!err) {
+				dbus_message_unref(reply);
+				browse_finish(op, 0, 0, items);
+				return;
+			}
+		} else
+			err = parse_num_items(reply, &num);
+		break;
+	}
+
+done:
+	dbus_message_unref(reply);
+	browse_finish(op, err, num, NULL);
+}
+
+static struct browse_op *browse_op_new(struct local_player *mp,
+					enum browse_op_type type,
+					const char *folder, void *user_data)
+{
+	struct browse_op *op;
+
+	op = g_new0(struct browse_op, 1);
+	op->mp = mp;
+	op->type = type;
+	op->folder = g_strdup(folder);
+	op->user_data = user_data;
+
+	return op;
+}
+
+static int browse_queue(struct browse_op *op)
+{
+	struct local_player *mp = op->mp;
+
+	if (!mp->browsable) {
+		browse_op_free(op);
+		return -ENOTSUP;
+	}
+
+	queue_push_tail(mp->browse_ops, op);
+	browse_run(mp);
+
+	return 0;
+}
+
+int local_player_change_folder(struct local_player *mp, const char *folder,
+				local_player_folder_cb cb, void *user_data)
+{
+	struct browse_op *op;
+
+	if (!folder || !cb)
+		return -EINVAL;
+
+	op = browse_op_new(mp, BROWSE_CHANGE_FOLDER, folder, user_data);
+	op->cb.folder = cb;
+
+	return browse_queue(op);
+}
+
+int local_player_list_items(struct local_player *mp, const char *folder,
+				uint32_t start, uint32_t end,
+				local_player_items_cb cb, void *user_data)
+{
+	struct browse_op *op;
+
+	if (!folder || !cb)
+		return -EINVAL;
+
+	op = browse_op_new(mp, BROWSE_LIST_ITEMS, folder, user_data);
+	op->cb.items = cb;
+	op->start = start;
+	op->end = end;
+
+	return browse_queue(op);
+}
+
+int local_player_search(struct local_player *mp, const char *value,
+				local_player_search_cb cb, void *user_data)
+{
+	struct browse_op *op;
+
+	if (!value || !cb)
+		return -EINVAL;
+
+	if (!mp->searchable)
+		return -ENOTSUP;
+
+	op = browse_op_new(mp, BROWSE_SEARCH, NULL, user_data);
+	op->cb.search = cb;
+	op->value = g_strdup(value);
+
+	return browse_queue(op);
+}
+
+static int item_send(struct local_player *mp, const char *item,
+							const char *method)
+{
+	DBusMessage *msg;
+
+	if (!mp->browsable)
+		return -ENOTSUP;
+
+	msg = dbus_message_new_method_call(mp->sender, item,
+					MEDIA_ITEM_INTERFACE, method);
+	if (!msg)
+		return -ENOMEM;
+
+	g_dbus_send_message(btd_get_dbus_connection(), msg);
+
+	return 0;
+}
+
+int local_player_play_item(struct local_player *mp, const char *item)
+{
+	DBG("%s", item);
+
+	return item_send(mp, item, "Play");
+}
+
+int local_player_add_to_now_playing(struct local_player *mp,
+							const char *item)
+{
+	DBG("%s", item);
+
+	return item_send(mp, item, "AddtoNowPlaying");
+}
+
+static void browse_op_free_cb(void *data)
+{
+	browse_op_free(data);
+}
+
+static void browse_cancel(void *data)
+{
+	struct browse_op *op = data;
+
+	/* The request is not the queue's any more: browse_finish must not
+	 * start another one from the dying player.
+	 */
+	switch (op->type) {
+	case BROWSE_CHANGE_FOLDER:
+		op->cb.folder(-ECANCELED, 0, op->user_data);
+		break;
+	case BROWSE_LIST_ITEMS:
+		op->cb.items(-ECANCELED, NULL, op->user_data);
+		break;
+	case BROWSE_SEARCH:
+		op->cb.search(-ECANCELED, NULL, 0, op->user_data);
+		break;
+	}
+
+	browse_op_free(op);
 }
 
 static void local_player_exit(DBusConnection *connection, void *user_data)
@@ -2760,6 +3446,28 @@ static gboolean set_name(struct local_player *mp, DBusMessageIter *iter)
 	return TRUE;
 }
 
+/* A Playlist property that changes, also to the same path, says that the now
+ * playing list changed.
+ */
+static gboolean set_playlist(struct local_player *mp, DBusMessageIter *iter)
+{
+	const char *value;
+	bool had = mp->playlist != NULL;
+
+	if (dbus_message_iter_get_arg_type(iter) != DBUS_TYPE_OBJECT_PATH)
+		return FALSE;
+
+	dbus_message_iter_get_basic(iter, &value);
+
+	g_free(mp->playlist);
+	mp->playlist = g_strdup(value);
+
+	if (had)
+		local_player_emit_now_playing_changed(mp);
+
+	return TRUE;
+}
+
 static gboolean set_player_property(struct local_player *mp, const char *key,
 							DBusMessageIter *entry)
 {
@@ -2805,6 +3513,16 @@ static gboolean set_player_property(struct local_player *mp, const char *key,
 
 	if (strcasecmp(key, "Identity") == 0)
 		return set_name(mp, &var);
+
+	/* Browsing, with org.bluez.MediaPlayer1's names (see media.h) */
+	if (strcasecmp(key, "Browsable") == 0)
+		return set_flag(mp, &var, &mp->browsable);
+
+	if (strcasecmp(key, "Searchable") == 0)
+		return set_flag(mp, &var, &mp->searchable);
+
+	if (strcasecmp(key, "Playlist") == 0)
+		return set_playlist(mp, &var);
 
 	DBG("%s not supported, ignoring", key);
 
@@ -2893,6 +3611,7 @@ static struct local_player *local_player_create(struct media_adapter *adapter,
 	mp->path = g_strdup(path);
 	mp->timer = g_timer_new();
 	mp->cbs = queue_new();
+	mp->browse_ops = queue_new();
 
 	mp->watch = g_dbus_add_disconnect_watch(conn, sender,
 						local_player_exit, mp,
