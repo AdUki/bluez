@@ -730,8 +730,16 @@ void media_player_search_complete(struct media_player *mp, int ret)
 	}
 
 	if (search == NULL) {
+		struct media_item *item;
+
+		item = media_player_create_subfolder(mp, "search", 0);
+		if (item == NULL) {
+			reply = btd_error_failed(mp->msg, "no search folder");
+			goto done;
+		}
+
 		search = g_new0(struct media_folder, 1);
-		search->item = media_player_create_subfolder(mp, "search", 0);
+		search->item = item;
 		mp->search = search;
 		mp->folders = g_slist_prepend(mp->folders, search);
 	}
@@ -1890,9 +1898,18 @@ static struct media_item *media_folder_create_item(struct media_player *mp,
 	item->player = mp;
 	item->uid = uid;
 
-	if (!uid && name[0] == '/')
+	if (!uid && name[0] == '/') {
+		char *c;
+
+		/* A folder named by the remote ("/Filesystem/My Music/search"):
+		 * what an object path cannot have becomes '_'.
+		 */
 		item->path = g_strdup_printf("%s%s", mp->path, name);
-	else
+		for (c = item->path + strlen(mp->path); *c; c++) {
+			if (!g_ascii_isalnum(*c) && *c != '_' && *c != '/')
+				*c = '_';
+		}
+	} else
 		item->path = g_strdup_printf("%s/item%" PRIu64 "",
 						folder->item->path, uid);
 
