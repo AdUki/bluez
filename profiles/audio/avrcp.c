@@ -222,6 +222,11 @@ struct avrcp_player {
 	void *user_data;
 	GDestroyNotify destroy;
 
+	/* Controller role: the current track's attributes carried a cover art
+	 * image handle.
+	 */
+	bool img_handle;
+
 	/* Target role browsing: the items listed so far, by path (owning)
 	 * and by UID, and the requests waiting for the player.
 	 */
@@ -3437,6 +3442,7 @@ static void avrcp_list_player_attributes(struct avrcp *session)
 struct parse_attribute_data {
 	struct media_player *mp;
 	struct media_item *item;
+	bool img_handle;
 };
 
 static void parse_attribute(const struct avrcp_attribute *attr,
@@ -3452,11 +3458,15 @@ static void parse_attribute(const struct avrcp_attribute *attr,
 	if (key == NULL)
 		return;
 
+	if (attr->id == AVRCP_MEDIA_ATTRIBUTE_IMG_HANDLE && attr->len)
+		data->img_handle = true;
+
 	media_player_set_metadata(data->mp, data->item, key, attr->value,
 								attr->len);
 }
 
-static void avrcp_player_parse_attributes(struct avrcp_player *player,
+/* Returns whether the attributes carried a cover art image handle. */
+static bool avrcp_player_parse_attributes(struct avrcp_player *player,
 					struct media_item *item,
 					struct iovec *iov, uint8_t count)
 {
@@ -3466,6 +3476,8 @@ static void avrcp_player_parse_attributes(struct avrcp_player *player,
 	};
 
 	avrcp_parse_attribute_list(iov, count, parse_attribute, &data);
+
+	return data.img_handle;
 }
 
 static void avrcp_abort_continuing(struct avrcp *session, uint8_t pdu_id)
@@ -3522,7 +3534,8 @@ static gboolean avrcp_get_element_attributes_rsp(struct avctp *conn,
 
 	item = media_player_set_playlist_item(mp, player->uid);
 
-	avrcp_player_parse_attributes(player, item, &iov, count);
+	player->img_handle = avrcp_player_parse_attributes(player, item, &iov,
+									count);
 
 	media_player_metadata_changed(mp);
 
@@ -3938,7 +3951,8 @@ static gboolean avrcp_get_item_attributes_rsp(struct avctp *conn,
 
 	item = media_player_set_playlist_item(mp, player->uid);
 
-	avrcp_player_parse_attributes(player, item, &iov, count);
+	player->img_handle = avrcp_player_parse_attributes(player, item, &iov,
+									count);
 
 	media_player_metadata_changed(mp);
 
@@ -4873,6 +4887,16 @@ static void avrcp_status_changed(struct avrcp *session,
 
 	media_player_set_status(mp, strval);
 	avrcp_get_play_status(session);
+
+	/* A target that offers cover art sends a track's image handle only
+	 * while a BIP connection is open, and the controller can open one
+	 * only once the player is known — after the track was read. Without
+	 * a handle, read the track again on a change of status: by now the
+	 * connection may be there, and the handle with it, rather than only
+	 * at the next track.
+	 */
+	if (session->controller->obex_port && !player->img_handle)
+		avrcp_get_element_attributes(session);
 }
 
 static void avrcp_track_changed(struct avrcp *session,
