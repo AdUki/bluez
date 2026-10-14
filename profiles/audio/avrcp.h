@@ -112,6 +112,7 @@ struct avrcp_player *avrcp_register_player(struct btd_adapter *adapter,
 						void *user_data,
 						GDestroyNotify destroy);
 void avrcp_unregister_player(struct avrcp_player *player);
+void avrcp_player_set_obex_port(struct avrcp_player *player, uint16_t port);
 
 void avrcp_player_event(struct avrcp_player *player, uint8_t id,
 							const void *data);

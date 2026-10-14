@@ -301,6 +301,14 @@ static void now_playing_changed(void *user_data)
 	avrcp_player_event(p->avrcp, AVRCP_EVENT_NOW_PLAYING_CHANGED, NULL);
 }
 
+static void obex_port_changed(void *user_data)
+{
+	struct player_link *p = user_data;
+
+	avrcp_player_set_obex_port(p->avrcp,
+					local_player_get_obex_port(p->lp));
+}
+
 static void player_removed(void *user_data)
 {
 	struct player_link *p = user_data;
@@ -316,6 +324,7 @@ static const struct local_player_callback player_cb =  {
 	.track_changed = track_changed,
 	.settings_changed = settings_changed,
 	.now_playing_changed = now_playing_changed,
+	.obex_port_changed = obex_port_changed,
 	.player_removed = player_removed,
 };
 
@@ -350,6 +359,8 @@ static void player_added(struct local_player *lp, void *user_data)
 		free(p);
 		return;
 	}
+
+	avrcp_player_set_obex_port(p->avrcp, local_player_get_obex_port(lp));
 
 	DBG("%p", p);
 

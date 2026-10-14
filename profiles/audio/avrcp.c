@@ -196,6 +196,7 @@ struct get_total_number_of_items_rsp {
 struct avrcp_server {
 	struct btd_adapter *adapter;
 	bool browsing;
+	uint16_t obex_port;
 	uint32_t tg_record_id;
 	uint32_t ct_record_id;
 	GSList *players;
@@ -235,6 +236,9 @@ struct avrcp_player {
 	struct avrcp_player_cb *cb;
 	void *user_data;
 	GDestroyNotify destroy;
+
+	/* Target role cover art */
+	uint16_t obex_port;
 
 	/* Target role browsing */
 	GHashTable *tg_items;
@@ -374,32 +378,54 @@ static uint16_t player_get_uid_counter(struct avrcp_player *player);
 static uint64_t player_get_uid(struct avrcp_player *player);
 static uint64_t tg_track_uid(struct avrcp_player *player);
 
-static void avrcp_browsing_record(sdp_record_t *record, sdp_data_t *version)
+static void avrcp_add_protos(sdp_record_t *record, sdp_data_t *version,
+					bool browsing, uint16_t obex_port)
 {
-	sdp_list_t *apseq;
-	uuid_t l2cap, avctp;
-	sdp_list_t *aproto, *proto[2];
-	sdp_data_t *psm;
-	uint16_t ap = AVCTP_BROWSING_PSM;
+	uuid_t l2cap, avctp, obex;
+	sdp_list_t *aproto = NULL, *apseq[2], *proto[2][2];
+	sdp_data_t *psm[2];
+	uint16_t browsing_psm = AVCTP_BROWSING_PSM;
+	int i, count = 0;
 
 	sdp_uuid16_create(&l2cap, L2CAP_UUID);
-	proto[0] = sdp_list_append(NULL, &l2cap);
-	psm = sdp_data_alloc(SDP_UINT16, &ap);
-	proto[0] = sdp_list_append(proto[0], psm);
-	apseq = sdp_list_append(NULL, proto[0]);
-
 	sdp_uuid16_create(&avctp, AVCTP_UUID);
-	proto[1] = sdp_list_append(NULL, &avctp);
-	proto[1] = sdp_list_append(proto[1], version);
-	apseq = sdp_list_append(apseq, proto[1]);
+	sdp_uuid16_create(&obex, OBEX_UUID);
 
-	aproto = sdp_list_append(NULL, apseq);
+	if (browsing) {
+		psm[count] = sdp_data_alloc(SDP_UINT16, &browsing_psm);
+		proto[count][0] = sdp_list_append(NULL, &l2cap);
+		proto[count][0] = sdp_list_append(proto[count][0], psm[count]);
+		proto[count][1] = sdp_list_append(NULL, &avctp);
+		proto[count][1] = sdp_list_append(proto[count][1], version);
+		count++;
+	}
+
+	if (obex_port) {
+		psm[count] = sdp_data_alloc(SDP_UINT16, &obex_port);
+		proto[count][0] = sdp_list_append(NULL, &l2cap);
+		proto[count][0] = sdp_list_append(proto[count][0], psm[count]);
+		proto[count][1] = sdp_list_append(NULL, &obex);
+		count++;
+	}
+
+	if (!count)
+		return;
+
+	for (i = 0; i < count; i++) {
+		apseq[i] = sdp_list_append(NULL, proto[i][0]);
+		apseq[i] = sdp_list_append(apseq[i], proto[i][1]);
+		aproto = sdp_list_append(aproto, apseq[i]);
+	}
+
 	sdp_set_add_access_protos(record, aproto);
 
-	free(psm);
-	sdp_list_free(proto[0], NULL);
-	sdp_list_free(proto[1], NULL);
-	sdp_list_free(apseq, NULL);
+	for (i = 0; i < count; i++) {
+		free(psm[i]);
+		sdp_list_free(proto[i][0], NULL);
+		sdp_list_free(proto[i][1], NULL);
+		sdp_list_free(apseq[i], NULL);
+	}
+
 	sdp_list_free(aproto, NULL);
 }
 
@@ -453,10 +479,10 @@ static sdp_record_t *avrcp_ct_record(bool browsing)
 	sdp_set_access_protos(record, aproto);
 
 	/* Additional Protocol Descriptor List */
-	if (browsing) {
+	if (browsing)
 		feat |= AVRCP_FEATURE_BROWSING;
-		avrcp_browsing_record(record, version);
-	}
+
+	avrcp_add_protos(record, version, browsing, 0);
 
 	/* Bluetooth Profile Descriptor List */
 	sdp_uuid16_create(&profile[0].uuid, AV_REMOTE_PROFILE_ID);
@@ -482,7 +508,7 @@ static sdp_record_t *avrcp_ct_record(bool browsing)
 	return record;
 }
 
-static sdp_record_t *avrcp_tg_record(bool browsing)
+static sdp_record_t *avrcp_tg_record(bool browsing, uint16_t obex_port)
 {
 	sdp_list_t *svclass_id, *pfseq, *apseq, *root;
 	uuid_t root_uuid, l2cap, avctp, avrtg;
@@ -528,10 +554,13 @@ static sdp_record_t *avrcp_tg_record(bool browsing)
 	sdp_set_access_protos(record, aproto_control);
 
 	/* Additional Protocol Descriptor List */
-	if (browsing) {
+	if (browsing)
 		feat |= AVRCP_FEATURE_BROWSING;
-		avrcp_browsing_record(record, version);
-	}
+
+	if (obex_port)
+		feat |= AVRCP_FEATURE_TG_COVERT_ART;
+
+	avrcp_add_protos(record, version, browsing, obex_port);
 
 	/* Bluetooth Profile Descriptor List */
 	sdp_uuid16_create(&profile[0].uuid, AV_REMOTE_PROFILE_ID);
@@ -5855,12 +5884,65 @@ struct avrcp_player *avrcp_register_player(struct btd_adapter *adapter,
 	return player;
 }
 
+static void avrcp_tg_record_update(struct avrcp_server *server)
+{
+	sdp_record_t *record;
+	uint16_t port = 0;
+	GSList *l;
+
+	/* Offer the cover art of the first player that has it */
+	for (l = server->players; l && !port; l = l->next) {
+		struct avrcp_player *player = l->data;
+
+		port = player->obex_port;
+	}
+
+	if (port == server->obex_port)
+		return;
+
+	server->obex_port = port;
+
+	if (!server->tg_record_id)
+		return;
+
+	DBG("OBEX PSM 0x%04x", port);
+
+	adapter_service_remove(server->adapter, server->tg_record_id);
+	server->tg_record_id = 0;
+
+	record = avrcp_tg_record(server->browsing, port);
+	if (!record) {
+		error("Unable to allocate new service record");
+		return;
+	}
+
+	if (adapter_service_add(server->adapter, record) < 0) {
+		error("Unable to register AVRCP target service record");
+		sdp_record_free(record);
+		return;
+	}
+
+	server->tg_record_id = record->handle;
+}
+
+void avrcp_player_set_obex_port(struct avrcp_player *player, uint16_t port)
+{
+	if (player->obex_port == port)
+		return;
+
+	player->obex_port = port;
+	avrcp_tg_record_update(player->server);
+}
+
 void avrcp_unregister_player(struct avrcp_player *player)
 {
 	struct avrcp_server *server = player->server;
 	GSList *l;
 
 	server->players = g_slist_remove(server->players, player);
+
+	if (player->obex_port)
+		avrcp_tg_record_update(server);
 
 	for (l = server->sessions; l; l = l->next) {
 		struct avrcp *session = l->data;
@@ -6119,7 +6201,7 @@ static int avrcp_target_server_probe(struct btd_profile *p,
 		return -EPROTONOSUPPORT;
 
 done:
-	record = avrcp_tg_record(server->browsing);
+	record = avrcp_tg_record(server->browsing, server->obex_port);
 	if (!record) {
 		error("Unable to allocate new service record");
 		avrcp_target_server_remove(p, adapter);
