@@ -113,6 +113,13 @@ as properties of **org.mpris.MediaPlayer2.Player**:
 	Now playing folder object. Each change of the property, even to the
 	same object, indicates that the now playing list has changed.
 
+:uint16 ObexPort: [experimental]
+
+	L2CAP PSM of the cover art (BIP) responder of the player, offered in
+	the AVRCP target record. The image handle of the current track is
+	the "bluez:ImgHandle" string entry of its Metadata, to be set only
+	while a remote controller is connected to the responder.
+
 Possible Errors:
 
 :org.bluez.Error.InvalidArguments:
