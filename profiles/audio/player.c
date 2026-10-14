@@ -2059,6 +2059,19 @@ void media_player_clear_playlist(struct media_player *mp)
 	if (mp->playlist) {
 		g_slist_free_full(mp->playlist->items, media_item_destroy);
 		mp->playlist->items = NULL;
+
+		/* The count went with the list: a ListItems would otherwise
+		 * stop at the old one, and it is not asked again while Now
+		 * Playing stays the scope.
+		 */
+		if (mp->playlist->number_of_items) {
+			mp->playlist->number_of_items = 0;
+			if (mp->scope == mp->playlist)
+				g_dbus_emit_property_changed(
+					btd_get_dbus_connection(), mp->path,
+					MEDIA_FOLDER_INTERFACE,
+					"NumberOfItems");
+		}
 	}
 
 	g_dbus_emit_property_changed(btd_get_dbus_connection(), mp->path,
