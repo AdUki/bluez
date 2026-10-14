@@ -686,11 +686,10 @@ static int avctp_send(struct avctp_channel *control, uint8_t transaction,
 	return err;
 }
 
-static int avctp_browsing_send(struct avctp_queue *queue,
+static int avctp_browsing_send(struct avctp_channel *browsing,
 				uint8_t transaction, uint8_t cr,
 				uint8_t *operands, size_t operand_count)
 {
-	struct avctp_channel *browsing = queue->chan;
 	struct avctp_header *avctp;
 	struct msghdr msg;
 	struct iovec iov[2];
@@ -828,8 +827,9 @@ static int process_browsing(void *data)
 	struct avctp_pending_req *p = req->p;
 	int ret;
 
-	ret = avctp_browsing_send(p->queue, p->transaction, AVCTP_COMMAND,
-					req->operands, req->operand_count);
+	ret = avctp_browsing_send(p->queue->chan, p->transaction,
+					AVCTP_COMMAND, req->operands,
+					req->operand_count);
 	if (ret < 0)
 		return ret;
 
