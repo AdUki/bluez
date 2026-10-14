@@ -113,6 +113,15 @@ player whose media library AVRCP controllers can browse:
 	any other folder. Sending it again in PropertiesChanged, also unchanged,
 	tells the controllers that the list changed.
 
+:uint16 ObexPort:
+
+	The L2CAP PSM of the player's cover art responder (BIP over OBEX, the
+	AVRCP Cover Art target), given at registration: the AVRCP target record
+	then offers cover art at it. A track's image handle is the
+	**bluez:ImgHandle** entry of its Metadata, a string of seven digits,
+	sent while a controller is connected to the responder (as AVRCP 1.6
+	asks).
+
 Possible Errors:
 
 :org.bluez.Error.InvalidArguments:

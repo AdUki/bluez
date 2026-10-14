@@ -66,6 +66,7 @@ const char *local_player_get_setting(struct local_player *lp, const char *key);
 int local_player_set_setting(struct local_player *lp, const char *key,
 							const char *value);
 const char *local_player_get_metadata(struct local_player *lp, const char *key);
+uint16_t local_player_get_obex_port(struct local_player *lp);
 GList *local_player_list_metadata(struct local_player *lp);
 const char *local_player_get_status(struct local_player *lp);
 uint32_t local_player_get_position(struct local_player *lp);

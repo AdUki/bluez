@@ -175,6 +175,7 @@ struct local_player {
 	char			*playlist;	/* Now playing folder */
 	char			*trackid;	/* The track's object */
 	struct queue		*browse_ops;	/* Head: the one running */
+	uint16_t		obex_port;	/* Cover art responder's PSM */
 };
 
 struct local_player_watch {
@@ -2338,6 +2339,11 @@ GList *local_player_list_metadata(struct local_player *mp)
 	return g_hash_table_get_keys(mp->track);
 }
 
+uint16_t local_player_get_obex_port(struct local_player *mp)
+{
+	return mp->obex_port;
+}
+
 const char *local_player_get_metadata(struct local_player *mp, const char *key)
 {
 	DBG("%s", key);
@@ -3330,6 +3336,10 @@ static gboolean parse_player_metadata(struct local_player *mp,
 		} else if (strcasecmp(key, "xesam:trackNumber") == 0) {
 			if (!parse_int32_metadata(mp, "TrackNumber", &var))
 				return FALSE;
+		} else if (strcasecmp(key, "bluez:ImgHandle") == 0) {
+			/* The track's cover art at the player's ObexPort */
+			if (!parse_string_metadata(mp, "ImgHandle", &var))
+				return FALSE;
 		} else if (strcasecmp(key, "mpris:trackid") == 0) {
 			const char *path;
 
@@ -3433,6 +3443,16 @@ static gboolean set_flag(struct local_player *mp, DBusMessageIter *iter,
 	return TRUE;
 }
 
+static gboolean set_obex_port(struct local_player *mp, DBusMessageIter *iter)
+{
+	if (dbus_message_iter_get_arg_type(iter) != DBUS_TYPE_UINT16)
+		return FALSE;
+
+	dbus_message_iter_get_basic(iter, &mp->obex_port);
+
+	return TRUE;
+}
+
 static gboolean set_name(struct local_player *mp, DBusMessageIter *iter)
 {
 	const char *value;
@@ -3529,6 +3549,9 @@ static gboolean set_player_property(struct local_player *mp, const char *key,
 
 	if (strcasecmp(key, "Playlist") == 0)
 		return set_playlist(mp, &var);
+
+	if (strcasecmp(key, "ObexPort") == 0)
+		return set_obex_port(mp, &var);
 
 	DBG("%s not supported, ignoring", key);
 
@@ -4122,6 +4145,11 @@ static void app_register_player(void *data, void *user_data)
 
 	if (g_dbus_proxy_get_property(proxy, "Identity", &iter)) {
 		if (!set_name(player, &iter))
+			goto fail;
+	}
+
+	if (g_dbus_proxy_get_property(proxy, "ObexPort", &iter)) {
+		if (!set_obex_port(player, &iter))
 			goto fail;
 	}
 

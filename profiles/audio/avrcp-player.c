@@ -353,6 +353,11 @@ static void player_added(struct local_player *lp, void *user_data)
 		return;
 	}
 
+	/* A player with a cover art responder offers it in the target record */
+	if (local_player_get_obex_port(lp))
+		avrcp_player_set_obex_port(p->avrcp,
+					local_player_get_obex_port(lp));
+
 	DBG("%p", p);
 
 	queue_push_tail(players, p);

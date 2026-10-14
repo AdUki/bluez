@@ -182,6 +182,7 @@ struct get_total_number_of_items_rsp {
 struct avrcp_server {
 	struct btd_adapter *adapter;
 	bool browsing;
+	uint16_t cover_art_psm;		/* In the target record, 0: none */
 	uint32_t tg_record_id;
 	uint32_t ct_record_id;
 	GSList *players;
@@ -226,6 +227,9 @@ struct avrcp_player {
 	 * image handle.
 	 */
 	bool img_handle;
+
+	/* Target role: the PSM of the player's cover art responder, 0: none */
+	uint16_t obex_port;
 
 	/* Target role browsing: the items listed so far, by path (owning)
 	 * and by UID, and the requests waiting for the player.
@@ -474,7 +478,58 @@ static sdp_record_t *avrcp_ct_record(bool browsing)
 	return record;
 }
 
-static sdp_record_t *avrcp_tg_record(bool browsing)
+/* The target's Additional Protocol Descriptor List: the browsing channel
+ * (L2CAP, AVCTP) and the cover art responder (L2CAP, OBEX), each if offered.
+ */
+static void avrcp_tg_add_protos(sdp_record_t *record, sdp_data_t *version,
+					bool browsing, uint16_t cover_art_psm)
+{
+	uuid_t l2cap, avctp, obex;
+	sdp_list_t *aproto = NULL, *apseq[2] = { NULL }, *proto[2][2] = {};
+	sdp_data_t *psm[2] = { NULL };
+	uint16_t bp = AVCTP_BROWSING_PSM;
+	int n = 0, i;
+
+	sdp_uuid16_create(&l2cap, L2CAP_UUID);
+	sdp_uuid16_create(&avctp, AVCTP_UUID);
+	sdp_uuid16_create(&obex, OBEX_UUID);
+
+	if (browsing) {
+		psm[n] = sdp_data_alloc(SDP_UINT16, &bp);
+		proto[n][0] = sdp_list_append(NULL, &l2cap);
+		proto[n][0] = sdp_list_append(proto[n][0], psm[n]);
+		proto[n][1] = sdp_list_append(NULL, &avctp);
+		proto[n][1] = sdp_list_append(proto[n][1], version);
+		n++;
+	}
+
+	if (cover_art_psm) {
+		psm[n] = sdp_data_alloc(SDP_UINT16, &cover_art_psm);
+		proto[n][0] = sdp_list_append(NULL, &l2cap);
+		proto[n][0] = sdp_list_append(proto[n][0], psm[n]);
+		proto[n][1] = sdp_list_append(NULL, &obex);
+		n++;
+	}
+
+	for (i = 0; i < n; i++) {
+		apseq[i] = sdp_list_append(NULL, proto[i][0]);
+		apseq[i] = sdp_list_append(apseq[i], proto[i][1]);
+		aproto = sdp_list_append(aproto, apseq[i]);
+	}
+
+	if (aproto)
+		sdp_set_add_access_protos(record, aproto);
+
+	for (i = 0; i < n; i++) {
+		free(psm[i]);
+		sdp_list_free(proto[i][0], NULL);
+		sdp_list_free(proto[i][1], NULL);
+		sdp_list_free(apseq[i], NULL);
+	}
+	sdp_list_free(aproto, NULL);
+}
+
+static sdp_record_t *avrcp_tg_record(bool browsing, uint16_t cover_art_psm)
 {
 	sdp_list_t *svclass_id, *pfseq, *apseq, *root;
 	uuid_t root_uuid, l2cap, avctp, avrtg;
@@ -520,10 +575,11 @@ static sdp_record_t *avrcp_tg_record(bool browsing)
 	sdp_set_access_protos(record, aproto_control);
 
 	/* Additional Protocol Descriptor List */
-	if (browsing) {
+	if (browsing)
 		feat |= AVRCP_FEATURE_BROWSING;
-		avrcp_browsing_record(record, version);
-	}
+	if (cover_art_psm)
+		feat |= AVRCP_FEATURE_TG_COVERT_ART;
+	avrcp_tg_add_protos(record, version, browsing, cover_art_psm);
 
 	/* Bluetooth Profile Descriptor List */
 	sdp_uuid16_create(&profile[0].uuid, AV_REMOTE_PROFILE_ID);
@@ -5696,12 +5752,65 @@ struct avrcp_player *avrcp_register_player(struct btd_adapter *adapter,
 	return player;
 }
 
+/* The target record registered again when the cover art it offers changed:
+ * the first player's with a responder, or none.
+ */
+static void avrcp_tg_record_update(struct avrcp_server *server)
+{
+	sdp_record_t *record;
+	uint16_t psm = 0;
+	GSList *l;
+
+	for (l = server->players; l && !psm; l = l->next) {
+		struct avrcp_player *player = l->data;
+
+		psm = player->obex_port;
+	}
+
+	if (psm == server->cover_art_psm)
+		return;
+
+	server->cover_art_psm = psm;
+
+	/* Not offered as target (yet): the probe uses the PSM */
+	if (server->tg_record_id == 0)
+		return;
+
+	adapter_service_remove(server->adapter, server->tg_record_id);
+	server->tg_record_id = 0;
+
+	record = avrcp_tg_record(server->browsing, psm);
+	if (!record) {
+		error("Unable to allocate new service record");
+		return;
+	}
+
+	if (adapter_service_add(server->adapter, record) < 0) {
+		error("Unable to register AVRCP target service record");
+		sdp_record_free(record);
+		return;
+	}
+
+	server->tg_record_id = record->handle;
+
+	DBG("cover art PSM 0x%04x", psm);
+}
+
+void avrcp_player_set_obex_port(struct avrcp_player *player, uint16_t psm)
+{
+	player->obex_port = psm;
+	avrcp_tg_record_update(player->server);
+}
+
 void avrcp_unregister_player(struct avrcp_player *player)
 {
 	struct avrcp_server *server = player->server;
 	GSList *l;
 
 	server->players = g_slist_remove(server->players, player);
+
+	if (player->obex_port)
+		avrcp_tg_record_update(server);
 
 	for (l = server->sessions; l; l = l->next) {
 		struct avrcp *session = l->data;
@@ -5960,7 +6069,7 @@ static int avrcp_target_server_probe(struct btd_profile *p,
 		return -EPROTONOSUPPORT;
 
 done:
-	record = avrcp_tg_record(server->browsing);
+	record = avrcp_tg_record(server->browsing, server->cover_art_psm);
 	if (!record) {
 		error("Unable to allocate new service record");
 		avrcp_target_server_remove(p, adapter);
