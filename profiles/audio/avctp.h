@@ -176,6 +176,9 @@ int avctp_send_release_passthrough(struct avctp *session);
 int avctp_send_vendordep(struct avctp *session, uint8_t transaction,
 				uint8_t code, uint8_t subunit,
 				uint8_t *operands, size_t operand_count);
+int avctp_send_browsing(struct avctp *session, uint8_t transaction,
+				uint8_t *operands, size_t operand_count);
+uint16_t avctp_get_browsing_mtu(struct avctp *session);
 int avctp_send_vendordep_req(struct avctp *session, uint8_t code,
 					uint8_t subunit, uint8_t *operands,
 					size_t operand_count,
