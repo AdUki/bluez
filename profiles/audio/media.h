@@ -48,6 +48,7 @@ struct local_player_callback {
 	void (*track_changed)(void *user_data);
 	void (*settings_changed)(const char *key, void *user_data);
 	void (*now_playing_changed)(void *user_data);
+	void (*obex_port_changed)(void *user_data);
 
 	/* Player removed (no further callbacks) */
 	void (*player_removed)(void *user_data);
@@ -108,6 +109,7 @@ bool local_player_get_browsable(struct local_player *lp);
 bool local_player_get_searchable(struct local_player *lp);
 const char *local_player_get_playlist(struct local_player *lp);
 const char *local_player_get_track(struct local_player *lp);
+uint16_t local_player_get_obex_port(struct local_player *lp);
 int local_player_change_folder(struct local_player *lp, const char *folder,
 				local_player_folder_cb_t cb, void *user_data);
 int local_player_list_items(struct local_player *lp, const char *folder,

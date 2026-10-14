@@ -176,6 +176,7 @@ struct local_player {
 	bool			searchable;
 	char			*playlist;
 	char			*trackid;
+	uint16_t		obex_port;
 };
 
 struct local_player_watch {
@@ -2136,6 +2137,11 @@ static void local_player_emit_now_playing_changed(struct local_player *mp)
 	LOCAL_PLAYER_EMIT_CB(mp, now_playing_changed, cbs->user_data);
 }
 
+static void local_player_emit_obex_port_changed(struct local_player *mp)
+{
+	LOCAL_PLAYER_EMIT_CB(mp, obex_port_changed, cbs->user_data);
+}
+
 static void local_player_emit_player_removed(struct local_player *mp)
 {
 	LOCAL_PLAYER_EMIT_CB(mp, player_removed, cbs->user_data);
@@ -2543,6 +2549,11 @@ const char *local_player_get_playlist(struct local_player *mp)
 const char *local_player_get_track(struct local_player *mp)
 {
 	return mp->trackid;
+}
+
+uint16_t local_player_get_obex_port(struct local_player *mp)
+{
+	return mp->obex_port;
 }
 
 static void browse_op_free(void *data)
@@ -3344,6 +3355,9 @@ static gboolean parse_player_metadata(struct local_player *mp,
 				return FALSE;
 		} else if (strcasecmp(key, "mpris:trackid") == 0) {
 			parse_trackid(mp, &var);
+		} else if (strcasecmp(key, "bluez:ImgHandle") == 0) {
+			if (!parse_string_metadata(mp, "ImgHandle", &var))
+				return FALSE;
 		} else
 			DBG("%s not supported, ignoring", key);
 
@@ -3479,6 +3493,25 @@ static gboolean set_playlist(struct local_player *mp, DBusMessageIter *iter)
 	return TRUE;
 }
 
+static gboolean set_obex_port(struct local_player *mp, DBusMessageIter *iter)
+{
+	uint16_t value;
+
+	if (dbus_message_iter_get_arg_type(iter) != DBUS_TYPE_UINT16)
+		return FALSE;
+
+	dbus_message_iter_get_basic(iter, &value);
+
+	if (mp->obex_port == value)
+		return TRUE;
+
+	mp->obex_port = value;
+
+	local_player_emit_obex_port_changed(mp);
+
+	return TRUE;
+}
+
 static gboolean set_player_property(struct local_player *mp, const char *key,
 							DBusMessageIter *entry)
 {
@@ -3533,6 +3566,9 @@ static gboolean set_player_property(struct local_player *mp, const char *key,
 
 	if (strcasecmp(key, "Playlist") == 0)
 		return set_playlist(mp, &var);
+
+	if (strcasecmp(key, "ObexPort") == 0)
+		return set_obex_port(mp, &var);
 
 	DBG("%s not supported, ignoring", key);
 
@@ -4140,6 +4176,11 @@ static void app_register_player(void *data, void *user_data)
 
 	if (g_dbus_proxy_get_property(proxy, "Playlist", &iter)) {
 		if (!set_playlist(player, &iter))
+			goto fail;
+	}
+
+	if (g_dbus_proxy_get_property(proxy, "ObexPort", &iter)) {
+		if (!set_obex_port(player, &iter))
 			goto fail;
 	}
 
