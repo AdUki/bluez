@@ -33,6 +33,9 @@
 #define PLAYER_PATH	DEVICE_PATH "/avrcp/player0"
 #define NOWPLAYING_PATH	PLAYER_PATH "/NowPlaying/item2"
 #define FILESYSTEM_PATH	PLAYER_PATH "/Filesystem/item2"
+#define SPACE_NAME	"Caf\xc3\xa9 Music"
+#define SPACE_FOLDER	"/Filesystem/" SPACE_NAME
+#define SEARCH_PATH	PLAYER_PATH "/Filesystem/Caf___Music/search"
 
 #define ITEM_UID	2
 #define TOTAL_ITEMS	42
@@ -152,9 +155,24 @@ static gboolean complete_total_items(gpointer user_data)
 	return FALSE;
 }
 
+static gboolean complete_search(gpointer user_data)
+{
+	if (context == NULL)
+		return FALSE;
+
+	media_player_search_complete(context->mp, TOTAL_ITEMS);
+
+	return FALSE;
+}
+
 static int test_search(struct media_player *mp, const char *string,
 							void *user_data)
 {
+	struct context *ctx = user_data;
+
+	if (!ctx->defer_completion)
+		g_idle_add(complete_search, NULL);
+
 	return 0;
 }
 
@@ -528,6 +546,45 @@ failed:
 	tester_test_failed();
 }
 
+/* Search() has to answer with the object path of the search folder. */
+static void search_reply(DBusPendingCall *call, void *user_data)
+{
+	DBusMessage *reply = dbus_pending_call_steal_reply(call);
+	const char *path;
+
+	if (reply == NULL) {
+		tester_warn("Search() got no reply");
+		tester_test_failed();
+		return;
+	}
+
+	if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_ERROR) {
+		tester_warn("Search() returned error: %s",
+					dbus_message_get_error_name(reply));
+		goto failed;
+	}
+
+	if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_OBJECT_PATH, &path,
+							DBUS_TYPE_INVALID)) {
+		tester_warn("Search() reply carries no object path");
+		goto failed;
+	}
+
+	if (g_strcmp0(path, SEARCH_PATH)) {
+		tester_warn("Search() returned '%s', expected '%s'", path,
+								SEARCH_PATH);
+		goto failed;
+	}
+
+	dbus_message_unref(reply);
+	tester_test_passed();
+	return;
+
+failed:
+	dbus_message_unref(reply);
+	tester_test_failed();
+}
+
 static void call_search(DBusPendingCall **pending,
 					DBusPendingCallNotifyFunction notify)
 {
@@ -788,6 +845,28 @@ static void test_search_busy(const void *data)
 	call_search(&context->pending2, search_busy_reply);
 }
 
+/*
+ * The search folder object path is made from the name of the folder
+ * searched, which can have characters an object path cannot, such as a
+ * space or a non-ASCII byte.
+ */
+static void test_search_space(const void *data)
+{
+	context = create_context();
+	if (context == NULL)
+		return;
+
+	g_assert(media_player_create_folder(context->mp, "/Filesystem",
+					PLAYER_FOLDER_TYPE_MIXED, 0) != NULL);
+	media_player_set_folder(context->mp, "/Filesystem", 1);
+	g_assert(media_player_create_folder(context->mp, SPACE_NAME,
+				PLAYER_FOLDER_TYPE_MIXED, ITEM_UID) != NULL);
+	media_player_set_folder(context->mp, SPACE_FOLDER, 1);
+	media_player_set_searchable(context->mp, true);
+
+	call_search(&context->pending, search_reply);
+}
+
 static void test_teardown(const void *data)
 {
 	destroy_context();
@@ -833,6 +912,9 @@ int main(int argc, char *argv[])
 
 	tester_add("/media_player/search_busy", NULL, NULL,
 					test_search_busy, test_teardown);
+
+	tester_add("/media_player/search_space", NULL, NULL,
+					test_search_space, test_teardown);
 
 	return tester_run();
 }
