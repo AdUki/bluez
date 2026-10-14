@@ -93,6 +93,26 @@ http://specifications.freedesktop.org/mpris-spec/latest/
 
 Note: If the sender disconnects its objects are automatically unregistered.
 
+The following properties of **org.bluez.MediaPlayer(5)** are also supported
+as properties of **org.mpris.MediaPlayer2.Player**:
+
+:boolean Browsable:
+
+	Indicates that the player object implements
+	**org.bluez.MediaFolder(5)**, as the root folder of the player, and its
+	items implement **org.bluez.MediaItem(5)**. The mpris:trackid entry of
+	the Metadata is the item of the current track.
+
+:boolean Searchable:
+
+	Indicates that the player implements **org.bluez.MediaFolder(5)**
+	Search. Requires Browsable.
+
+:object Playlist:
+
+	Now playing folder object. Each change of the property, even to the
+	same object, indicates that the now playing list has changed.
+
 Possible Errors:
 
 :org.bluez.Error.InvalidArguments:

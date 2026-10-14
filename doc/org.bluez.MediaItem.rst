@@ -22,6 +22,11 @@ Interface
 		prefix]/{hci0,hci1,...}/dev_{BDRADDR}/player#/item# (Controller role)
 :Used by:	**bluetoothctl-player(1)**
 
+In the target role, the items are the objects listed by the
+**org.bluez.MediaFolder(5)** ListItems of the player registered with
+**org.bluez.Media(5)** RegisterPlayer. bluetoothd does not wait for the reply of
+Play and AddtoNowPlaying.
+
 Methods
 -------
 
