@@ -4101,6 +4101,9 @@ static void avrcp_set_player_value(struct avrcp *session, uint8_t attr,
 					avrcp_player_value_rsp, session);
 }
 
+static void set_browsed_player(struct avrcp *session,
+					struct avrcp_player *player);
+
 static gboolean avrcp_set_addressed_player_rsp(struct avctp *conn, uint8_t code,
 					uint8_t subunit, uint8_t transaction,
 					uint8_t *operands, size_t operand_count,
@@ -4117,6 +4120,9 @@ static gboolean avrcp_set_addressed_player_rsp(struct avctp *conn, uint8_t code,
 		return FALSE;
 
 	player->addressed = true;
+
+	/* Browsing waits for the player to be addressed */
+	set_browsed_player(session, player);
 
 	return FALSE;
 }
@@ -5052,8 +5058,16 @@ static void avrcp_addressed_player_changed(struct avrcp *session,
 	struct avrcp_player *player = session->controller->player;
 	uint16_t id = get_be16(&pdu->params[1]);
 
-	if (player != NULL && player->id == id)
+	/* Already known from the player list, which came first: it is the
+	 * addressed one now, and browsing waited for that.
+	 */
+	if (player != NULL && player->id == id) {
+		if (!player->addressed) {
+			player->addressed = true;
+			set_browsed_player(session, player);
+		}
 		return;
+	}
 
 	player = find_ct_player(session, id);
 	if (player == NULL) {
