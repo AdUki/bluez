@@ -2071,6 +2071,27 @@ static struct local_player_item *tg_item_find(struct avrcp_player *player,
 	return t ? t->item : NULL;
 }
 
+/* What the player's track says of itself now, in an item's metadata keys */
+static GHashTable *tg_track_metadata(struct avrcp_player *player)
+{
+	GHashTable *md = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+								g_free);
+	GList *keys, *l;
+
+	keys = player->cb->list_metadata(player->user_data);
+	for (l = keys; l; l = l->next) {
+		const char *v = player->cb->get_metadata(l->data,
+							player->user_data);
+
+		if (v)
+			g_hash_table_insert(md, g_strdup(l->data),
+								g_strdup(v));
+	}
+	g_list_free(keys);
+
+	return md;
+}
+
 /* The UID of the track playing, an item of the library: the one it was
  * listed with, or a new one (with what the track's metadata says of it, for
  * GetItemAttributes) when it was not listed yet. 0 for a player that is not
@@ -2080,7 +2101,6 @@ static uint64_t tg_track_uid(struct avrcp_player *player)
 {
 	struct local_player_item *item;
 	const char *path, *title;
-	GList *keys, *l;
 	struct tg_item *t;
 
 	if (!tg_browsable(player) || !player->cb->get_track)
@@ -2098,18 +2118,7 @@ static uint64_t tg_track_uid(struct avrcp_player *player)
 	item = g_new0(struct local_player_item, 1);
 	item->path = g_strdup(path);
 	item->type = g_strdup("audio");
-	item->metadata = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
-								g_free);
-	keys = player->cb->list_metadata(player->user_data);
-	for (l = keys; l; l = l->next) {
-		const char *v = player->cb->get_metadata(l->data,
-							player->user_data);
-
-		if (v)
-			g_hash_table_insert(item->metadata, g_strdup(l->data),
-								g_strdup(v));
-	}
-	g_list_free(keys);
+	item->metadata = tg_track_metadata(player);
 	title = g_hash_table_lookup(item->metadata, "Title");
 	item->name = g_strdup(title ? title : "");
 
@@ -2709,6 +2718,16 @@ static void avrcp_handle_get_item_attributes(struct avrcp *session,
 	if (!item) {
 		tg_browse_reject(pdu, AVRCP_STATUS_DOES_NOT_EXIST);
 		return;
+	}
+
+	/* The track playing, as it is now rather than as it was listed: its
+	 * cover art handle comes only once the controller's BIP channel is
+	 * open, which is often after the listing.
+	 */
+	if (player->cb->get_track && !g_strcmp0(item->path,
+				player->cb->get_track(player->user_data))) {
+		g_hash_table_unref(item->metadata);
+		item->metadata = tg_track_metadata(player);
 	}
 
 	req = tg_req_new(session, player, pdu, transaction);
