@@ -47,6 +47,7 @@ struct local_player_callback {
 							void *user_data);
 	void (*track_changed)(void *user_data);
 	void (*settings_changed)(const char *key, void *user_data);
+	void (*now_playing_changed)(void *user_data);
 
 	/* Player removed (no further callbacks) */
 	void (*player_removed)(void *user_data);
@@ -76,6 +77,47 @@ bool local_player_pause(struct local_player *lp);
 bool local_player_seek(struct local_player *lp, int64_t offset_usec);
 bool local_player_next(struct local_player *lp);
 bool local_player_previous(struct local_player *lp);
+
+/*
+ * Local media player browsing
+ *
+ * The player object is the root folder. Each callback is called once: with
+ * -ENOTSUP, -ENOENT or -EIO if the player replies with an error, -EINVAL if
+ * the reply is malformed, or -ECANCELED if the player is removed first. The
+ * items callback takes ownership of the items.
+ */
+struct local_player_item {
+	char *path;
+	char *name;
+	char *type;
+	char *folder_type;
+	bool playable;
+	GHashTable *metadata;	/* Same keys as local_player_get_metadata */
+};
+
+typedef void (*local_player_folder_cb_t)(int err, uint32_t num_items,
+							void *user_data);
+typedef void (*local_player_items_cb_t)(int err, GSList *items,
+							void *user_data);
+typedef void (*local_player_search_cb_t)(int err, const char *folder,
+					uint32_t num_items, void *user_data);
+
+void local_player_item_free(void *data);
+const char *local_player_get_path(struct local_player *lp);
+bool local_player_get_browsable(struct local_player *lp);
+bool local_player_get_searchable(struct local_player *lp);
+const char *local_player_get_playlist(struct local_player *lp);
+const char *local_player_get_track(struct local_player *lp);
+int local_player_change_folder(struct local_player *lp, const char *folder,
+				local_player_folder_cb_t cb, void *user_data);
+int local_player_list_items(struct local_player *lp, const char *folder,
+				uint32_t start, uint32_t end,
+				local_player_items_cb_t cb, void *user_data);
+int local_player_search(struct local_player *lp, const char *value,
+				local_player_search_cb_t cb, void *user_data);
+int local_player_play_item(struct local_player *lp, const char *item);
+int local_player_add_to_now_playing(struct local_player *lp,
+							const char *item);
 
 typedef void (*local_player_added_t)(struct local_player *lp, void *user_data);
 
