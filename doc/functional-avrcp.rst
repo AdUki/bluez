@@ -62,3 +62,40 @@ test_avrcp_GHSA_m2vx_pw5f_rc8v
 	similarly sized buffer. With 255 valid attributes both overflow.
 
 	Marked ``sa``.
+
+test_avrcp_browsing_parameter_length
+------------------------------------
+
+:Setup: Two hosts paired over BR/EDR. host0 runs `bluetoothd` without
+	the `avrcp` plugin and drives AVCTP from the test over L2CAP
+	sockets. host1 runs `bluetoothd`, with no media player
+	registered, and trusts host0.
+
+	.. code-block::
+
+		+--------------------------+                 +--------------------------+
+		| host0                    |     BR/EDR      | host1                    |
+		| bluetoothd -P avrcp      | --------------> | bluetoothd               |
+		| raw AVRCP Controller     |  AVCTP PSM 0x17 | AVRCP Target             |
+		| (L2CAP sockets)          |  and PSM 0x1b   |                          |
+		|                          | <============== |                          |
+		+--------------------------+                 +--------------------------+
+
+:Steps:
+	1. host0 connects the AVCTP control channel, then the browsing
+	   channel (Enhanced Retransmission Mode).
+	2. host0 sends a ``GetFolderItems`` with a parameter length of 10
+	   but no parameters.
+	3. host0 sends a ``GetFolderItems`` of the media player list, from
+	   item 0 to 0, with its 10 bytes of parameters.
+
+:Expected:
+	1. The first ``GetFolderItems`` is answered with status Invalid
+	   Parameter.
+	2. The second one is answered with status Range Out of Bounds, as
+	   host1 has no media player.
+
+:Notes: The parameter length of a browsing PDU was not checked against
+	the bytes received, so the target took the missing parameters from
+	what its receive buffer held before, here zeroes, and answered the
+	first command as the second one.

@@ -7,6 +7,7 @@ import select
 import os
 import subprocess
 import struct
+import socket
 
 import pytest
 import dbus
@@ -292,3 +293,103 @@ def check_avrcp_GHSA_m2vx_pw5f_rc8v(bus):
 
     target = AvrcpTarget()
     return register_profile(bus, target)
+
+
+@mainloop_wrap
+def set_trusted(bdaddr):
+    path = "/org/bluez/hci0/dev_" + bdaddr.upper().replace(":", "_")
+    props = dbus.Interface(
+        get_dbus().get_object("org.bluez", path), "org.freedesktop.DBus.Properties"
+    )
+    props.Set("org.bluez.Device1", "Trusted", dbus.Boolean(True))
+
+
+SOL_L2CAP = 6
+L2CAP_OPTIONS = 0x01
+L2CAP_OPTIONS_FMT = "=HHHBBBxH"
+L2CAP_MODE_ERTM = 0x03
+
+AVCTP_CONTROL_PSM = 0x17
+AVCTP_BROWSING_PSM = 0x1B
+AV_REMOTE_PID = 0x110E
+
+AVRCP_GET_FOLDER_ITEMS = 0x71
+AVRCP_STATUS_INVALID_PARAM = 0x01
+AVRCP_STATUS_OUT_OF_BOUNDS = 0x0B
+
+
+def l2cap_connect(bdaddr, psm, mode=None):
+    sock = socket.socket(
+        socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP
+    )
+
+    if mode is not None:
+        size = struct.calcsize(L2CAP_OPTIONS_FMT)
+        opts = list(
+            struct.unpack(
+                L2CAP_OPTIONS_FMT, sock.getsockopt(SOL_L2CAP, L2CAP_OPTIONS, size)
+            )
+        )
+        opts[3] = mode
+        sock.setsockopt(SOL_L2CAP, L2CAP_OPTIONS, struct.pack(L2CAP_OPTIONS_FMT, *opts))
+
+    sock.settimeout(10)
+    sock.connect((bdaddr, psm))
+    return sock
+
+
+def avrcp_browsing_commands(bdaddr, commands):
+    """
+    Connect the AVCTP control and browsing channels, and send the AVRCP
+    browsing commands, given as (pdu_id, parameter length, parameters).
+
+    Returns the parameters of the responses.
+    """
+    # The browsing channel is only accepted once the control one is connected
+    control = l2cap_connect(bdaddr, AVCTP_CONTROL_PSM)
+    browsing = l2cap_connect(bdaddr, AVCTP_BROWSING_PSM, L2CAP_MODE_ERTM)
+    responses = []
+
+    for transaction, (pdu_id, param_len, params) in enumerate(commands):
+        browsing.send(
+            bytes([transaction << 4])
+            + struct.pack(">HBH", AV_REMOTE_PID, pdu_id, param_len)
+            + params
+        )
+
+        rsp = browsing.recv(1024)
+        assert rsp[0] == (transaction << 4) | 0x02, f"response: {rsp.hex()}"
+        assert rsp[3] == pdu_id, f"response: {rsp.hex()}"
+        responses.append(rsp[6:])
+
+    browsing.close()
+    control.close()
+
+    return responses
+
+
+@host_config(
+    [Bluetoothd(args=("-P", "avrcp")), Agent()],
+    [Agent()],
+)
+def test_avrcp_browsing_parameter_length(paired_hosts):
+    host0, host1 = paired_hosts
+
+    host1.call(set_trusted, host0.bdaddr)
+
+    # Media player list, from item 0 to 0, without attributes
+    params = bytes(10)
+
+    short, valid = host0.call(
+        avrcp_browsing_commands,
+        host1.bdaddr,
+        [
+            (AVRCP_GET_FOLDER_ITEMS, len(params), b""),
+            (AVRCP_GET_FOLDER_ITEMS, len(params), params),
+        ],
+    )
+
+    assert short == bytes([AVRCP_STATUS_INVALID_PARAM]), short.hex()
+
+    # host1 has no media player
+    assert valid == bytes([AVRCP_STATUS_OUT_OF_BOUNDS]), valid.hex()
