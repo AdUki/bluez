@@ -20,6 +20,8 @@ from pytest_bluezenv import (
     mainloop_wrap,
     get_dbus,
     HostPlugin,
+    EventPluginMixin,
+    dbus_service_event_method,
 )
 
 
@@ -393,3 +395,152 @@ def test_avrcp_browsing_parameter_length(paired_hosts):
 
     # host1 has no media player
     assert valid == bytes([AVRCP_STATUS_OUT_OF_BOUNDS]), valid.hex()
+
+
+AVRCP_TARGET_UUID = "0000110c-0000-1000-8000-00805f9b34fb"
+
+MEDIA_PLAYER_INTERFACE = "org.bluez.MediaPlayer1"
+MEDIA_FOLDER_INTERFACE = "org.bluez.MediaFolder1"
+MEDIA_ITEM_INTERFACE = "org.bluez.MediaItem1"
+
+TG_PLAYER_NAME = "Browsable Player"
+TG_PLAYER = "/org/bluez/test/player"
+TG_FOLDER = TG_PLAYER + "/music"
+TG_TRACK = TG_FOLDER + "/track"
+
+# The content of each folder, the player object being the root folder
+TG_FOLDERS = {
+    TG_PLAYER: {TG_FOLDER: {"Name": "Music", "Type": "folder", "Playable": False}},
+    TG_FOLDER: {TG_TRACK: {"Name": "Track", "Type": "audio", "Playable": True}},
+}
+
+
+class TgPlayer(dbus.service.Object):
+    """Player object of the browsable player, and its root folder."""
+
+    def __init__(self, bus):
+        self.folder = TG_PLAYER
+        super().__init__(bus, TG_PLAYER)
+
+    @dbus.service.method(MEDIA_FOLDER_INTERFACE, in_signature="o", out_signature="")
+    def ChangeFolder(self, folder):
+        self.folder = str(folder)
+
+    @dbus.service.method(
+        MEDIA_FOLDER_INTERFACE, in_signature="a{sv}", out_signature="a{oa{sv}}"
+    )
+    def ListItems(self, filters):
+        return TG_FOLDERS[self.folder]
+
+    @dbus.service.method(
+        "org.freedesktop.DBus.Properties", in_signature="ss", out_signature="v"
+    )
+    def Get(self, interface, name):
+        # NumberOfItems of org.bluez.MediaFolder1
+        return dbus.UInt32(len(TG_FOLDERS[self.folder]))
+
+
+class TgTrack(dbus.service.Object):
+    def __init__(self, bus, events):
+        self.events = events
+        super().__init__(bus, TG_TRACK)
+
+    Play = dbus_service_event_method(MEDIA_ITEM_INTERFACE, "Play")
+
+
+class BrowsablePlayer(HostPlugin, EventPluginMixin):
+    """
+    Host plugin registering a browsable local player with
+    org.bluez.Media1.RegisterPlayer: a root folder holding a folder with
+    one track. Play of the track is pushed as an org.bluez.MediaItem1.Play
+    event.
+    """
+
+    name = "browsable_player"
+    depends = [Bluetoothd()]
+
+    @mainloop_wrap
+    def setup(self, impl):
+        EventPluginMixin.setup(self, impl)
+
+        bus = get_dbus()
+        self.objects = [TgPlayer(bus), TgTrack(bus, self.events)]
+
+        media = dbus.Interface(
+            bus.get_object("org.bluez", "/org/bluez/hci0"), "org.bluez.Media1"
+        )
+        props = {
+            "Identity": dbus.String(TG_PLAYER_NAME),
+            "Browsable": dbus.Boolean(True),
+        }
+        media.RegisterPlayer(
+            dbus.ObjectPath(TG_PLAYER), dbus.Dictionary(props, signature="sv")
+        )
+
+    @mainloop_wrap
+    def teardown(self):
+        for obj in self.objects:
+            obj.remove_from_connection()
+
+
+def bluez_interface(path, interface):
+    return dbus.Interface(get_dbus().get_object("org.bluez", path), interface)
+
+
+@mainloop_wrap
+def find_browsable_player():
+    """Return the path and the name of the remote player, once browsable."""
+    manager = bluez_interface("/", "org.freedesktop.DBus.ObjectManager")
+
+    for path, interfaces in manager.GetManagedObjects().items():
+        props = interfaces.get(MEDIA_PLAYER_INTERFACE, {})
+        if props.get("Browsable") and MEDIA_FOLDER_INTERFACE in interfaces:
+            return str(path), str(props["Name"])
+
+    return None
+
+
+@mainloop_wrap
+def list_items(player):
+    """List the current folder of the player, as {name: path}."""
+    folder = bluez_interface(player, MEDIA_FOLDER_INTERFACE)
+    items = folder.ListItems(dbus.Dictionary({}, signature="sv"))
+    return {str(props["Name"]): str(path) for path, props in items.items()}
+
+
+@mainloop_wrap
+def change_folder(player, path):
+    folder = bluez_interface(player, MEDIA_FOLDER_INTERFACE)
+    folder.ChangeFolder(dbus.ObjectPath(path))
+
+
+@mainloop_wrap
+def play_item(path):
+    bluez_interface(path, MEDIA_ITEM_INTERFACE).Play()
+
+
+@host_config(
+    [Agent()],
+    [BrowsablePlayer(), Agent()],
+)
+def test_avrcp_tg_browse(paired_hosts):
+    host0, host1 = paired_hosts
+
+    host1.call(set_trusted, host0.bdaddr)
+    host0.agent.device_method(host1.bdaddr, "ConnectProfile", AVRCP_TARGET_UUID)
+    host0.agent.expect("org.bluez.Device1.ConnectProfile:reply")
+
+    wait_until(lambda: host0.call(find_browsable_player))
+    player, name = host0.call(find_browsable_player)
+    assert name == TG_PLAYER_NAME
+
+    # The controller names a folder with its path
+    items = host0.call(list_items, player)
+    assert list(items) == ["/Filesystem/Music"]
+
+    host0.call(change_folder, player, items["/Filesystem/Music"])
+    items = host0.call(list_items, player)
+    assert list(items) == ["Track"]
+
+    host0.call(play_item, items["Track"])
+    host1.browsable_player.expect(f"{MEDIA_ITEM_INTERFACE}.Play")

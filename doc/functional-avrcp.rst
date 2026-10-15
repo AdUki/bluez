@@ -99,3 +99,39 @@ test_avrcp_browsing_parameter_length
 	the bytes received, so the target took the missing parameters from
 	what its receive buffer held before, here zeroes, and answered the
 	first command as the second one.
+
+test_avrcp_tg_browse
+--------------------
+
+:Setup: Two hosts paired over BR/EDR, each running `bluetoothd`. host1
+	trusts host0, and registers a browsable local player with
+	``org.bluez.Media1.RegisterPlayer``: its player object is the root
+	folder (``org.bluez.MediaFolder1``), holding a folder "Music" with
+	a track "Track" (``org.bluez.MediaItem1``).
+
+	.. code-block::
+
+		+--------------------------+                 +--------------------------+
+		| host0                    |     BR/EDR      | host1                    |
+		| bluetoothd               | --------------> | bluetoothd               |
+		| AVRCP Controller         |  AVCTP control  | AVRCP Target             |
+		| org.bluez.MediaPlayer1   |  and browsing   | browsable local player   |
+		|                          | <============== |                          |
+		+--------------------------+                 +--------------------------+
+
+:Steps:
+	1. host0 connects the AVRCP Target UUID
+	   (``0000110c-0000-1000-8000-00805f9b34fb``) with
+	   ``org.bluez.Device1.ConnectProfile``.
+	2. Wait until host0 has a ``Browsable`` player implementing
+	   ``org.bluez.MediaFolder1``.
+	3. host0 lists its root folder with ``ListItems``.
+	4. host0 changes to the folder listed with ``ChangeFolder``, and
+	   lists it.
+	5. host0 calls ``org.bluez.MediaItem1.Play`` on the track listed.
+
+:Expected:
+	1. The player of host0 has the name of the player of host1.
+	2. The root folder lists the folder, as "/Filesystem/Music".
+	3. The folder lists "Track".
+	4. ``Play`` is called on the track of host1.
