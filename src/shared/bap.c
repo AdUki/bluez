@@ -62,6 +62,7 @@
 #define BAP_METADATA_CONTEXT_LTV_TYPE		0x02
 #define BAP_METADATA_PROGRAM_INFO_LTV_TYPE	0x03
 #define BAP_METADATA_LANGUAGE_LTV_TYPE		0x04
+#define BAP_METADATA_CCID_LIST_LTV_TYPE		0x05
 
 struct bt_bap_pac_changed {
 	unsigned int id;
@@ -3452,6 +3453,11 @@ static void bap_metadata_process(size_t i, uint8_t l, uint8_t t, uint8_t *v,
 		break;
 	case BAP_METADATA_PROGRAM_INFO_LTV_TYPE:
 	case BAP_METADATA_LANGUAGE_LTV_TYPE:
+	/* The client's content control services (GMCS, GTBS) the stream
+	 * belongs to: informational for the server, and sent in every
+	 * Enable by Android, which gives up on a server that refuses it.
+	 */
+	case BAP_METADATA_CCID_LIST_LTV_TYPE:
 		break;
 	default:
 		ascs_ase_rsp_add(data->rsp, data->ep->id,
