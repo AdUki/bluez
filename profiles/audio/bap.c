@@ -3304,6 +3304,18 @@ static bool link_enabled(const void *data, const void *match_data)
 			bt_bap_stream_get_io(stream));
 }
 
+static struct btd_profile bap_bcast_profile;
+
+static gboolean bcast_ended(gpointer user_data)
+{
+	struct btd_device *device = user_data;
+
+	device_remove_profile(device, &bap_bcast_profile);
+	btd_device_unref(device);
+
+	return FALSE;
+}
+
 static void bap_state_bcast_sink(struct bt_bap_stream *stream,
 				uint8_t old_state, uint8_t new_state,
 				void *user_data)
@@ -3328,6 +3340,15 @@ static void bap_state_bcast_sink(struct bt_bap_stream *stream,
 		/* Release stream if idle */
 		if (setup)
 			setup_free(setup);
+		/* The broadcast this session found has ended: drop the session,
+		 * so that the next announcement probes the broadcaster anew
+		 * (the device may stay, bonded or still in range). Not for one
+		 * a Broadcast Assistant set up, which BASS owns.
+		 */
+		if (queue_isempty(data->bcast_snks) &&
+				btd_service_get_user_data(data->service) == data)
+			g_idle_add(bcast_ended, btd_device_ref(
+					btd_service_get_device(data->service)));
 		break;
 	case BT_BAP_STREAM_STATE_CONFIG:
 		if (!setup)
@@ -3693,6 +3714,11 @@ static int pa_sync(struct bap_data *data)
 	if (!data->listen_io) {
 		error("%s", err->message);
 		g_error_free(err);
+		/* Nothing was found and nothing will be: drop the session, so
+		 * that the next announcement probes the broadcaster again (a
+		 * stored one is probed before the adapter is up).
+		 */
+		g_idle_add(bcast_ended, btd_device_ref(data->device));
 	}
 
 	return 0;
