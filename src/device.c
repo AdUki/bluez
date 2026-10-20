@@ -225,6 +225,7 @@ struct btd_device {
 	uint32_t	current_flags;
 	GSList		*svc_callbacks;
 	GSList		*eir_uuids;
+	uint8_t		bcaa_id[3];	/* Broadcast ID last probed */
 	struct bt_ad	*ad;
 	uint8_t         ad_flags[1];
 	char		name[MAX_NAME_LENGTH + 1];
@@ -2536,6 +2537,46 @@ void device_set_manufacturer_data(struct btd_device *dev, struct queue *queue,
 	queue_foreach(queue, add_manufacturer_data, dev);
 }
 
+struct probe_data {
+	struct btd_device *dev;
+	GSList *uuids;
+};
+
+static void dev_probe(struct btd_profile *p, void *user_data);
+
+/* A Broadcast Audio Announcement probes the broadcast source profile whenever
+ * the device has no session for it (the last one ended: BAP drops it once its
+ * streams are gone) or the Broadcast ID changed (another broadcast; the session
+ * of the one before is dropped for it). Resolved services replace what a device
+ * advertises, but the announcement is only ever advertised, never a service:
+ * without this a bonded device that starts broadcasting is never probed. It is
+ * not added to the device's UUIDs either, which are stored: the device is not
+ * broadcasting the next time it is loaded.
+ */
+static void device_probe_bcaa(struct btd_device *dev, const uint8_t *id,
+								uint8_t len)
+{
+	struct btd_profile *p;
+	GSList *uuids;
+
+	p = btd_profile_find_remote_uuid(BCAA_SERVICE_UUID);
+	if (!p || dev->blocked || len < sizeof(dev->bcaa_id))
+		return;
+
+	if (find_service_with_profile(dev->services, p) &&
+			!memcmp(dev->bcaa_id, id, sizeof(dev->bcaa_id)))
+		return;
+
+	DBG("%s Broadcast ID 0x%06x", dev->path, get_le24(id));
+
+	memcpy(dev->bcaa_id, id, sizeof(dev->bcaa_id));
+	device_remove_profile(dev, p);
+
+	uuids = g_slist_append(NULL, (void *) BCAA_SERVICE_UUID);
+	dev_probe(p, &(struct probe_data) { dev, uuids });
+	g_slist_free(uuids);
+}
+
 static void add_service_data(void *data, void *user_data)
 {
 	struct eir_sd *sd = data;
@@ -2545,6 +2586,9 @@ static void add_service_data(void *data, void *user_data)
 
 	if (bt_string_to_uuid(&uuid, sd->uuid) < 0)
 		return;
+
+	if (!bt_uuid_strcmp(sd->uuid, BCAA_SERVICE_UUID))
+		device_probe_bcaa(dev, sd->data, sd->data_len);
 
 	if (!bt_ad_add_service_data(dev->ad, &uuid, sd->data, sd->data_len))
 		return;
@@ -5819,11 +5863,6 @@ bool btd_device_has_uuid(struct btd_device *device, const char *uuid)
 	return g_slist_find_custom(device->uuids, uuid,
 						(GCompareFunc)strcasecmp);
 }
-
-struct probe_data {
-	struct btd_device *dev;
-	GSList *uuids;
-};
 
 static struct btd_service *probe_service(struct btd_device *device,
 						struct btd_profile *profile,
