@@ -1657,6 +1657,8 @@ static void bcast_qos_set(void *user_data, int err)
 }
 
 static void bap_update_bcast_qos(const struct media_transport *transport);
+static void bap_take_bcode(struct bap_transport *bap,
+					const struct iovec *bcode);
 
 static void set_bcast_qos(const GDBusPropertyTable *property,
 			DBusMessageIter *dict, GDBusPendingPropertySet id,
@@ -1703,6 +1705,7 @@ static void set_bcast_qos(const GDBusPropertyTable *property,
 		}
 
 		bap_qos->bcast.bcode = util_iov_new(val, len);
+		bap_take_bcode(bap, bap_qos->bcast.bcode);
 	}
 
 	bt_bap_stream_qos(bap->stream, bap_qos, NULL, NULL);
@@ -2068,6 +2071,45 @@ static void bap_update_links(const struct media_transport *transport)
 		transport->ops->update_links(transport);
 }
 
+/* The transport keeps its own copy of the stream's QoS, read whenever its
+ * properties are (GetManagedObjects too). A broadcast QoS points to its
+ * Broadcast Code, which the stream's setup owns and frees when the stream is
+ * cleared, before the stream goes idle and before the transport goes: a QoS
+ * read in between appended freed memory and D-Bus aborted bluetoothd. So the
+ * copy has a code of its own, taken when the code is known to be good (the
+ * stream configured, a client setting it), and the stream's is never read
+ * again.
+ */
+static void bap_take_bcode(struct bap_transport *bap,
+					const struct iovec *bcode)
+{
+	util_iov_free(bap->qos.bcast.bcode, 1);
+	bap->qos.bcast.bcode = util_iov_dup(bcode, 1);
+}
+
+static bool bap_set_qos(struct bap_transport *bap,
+					const struct bt_bap_qos *qos)
+{
+	struct bt_bap_qos cmp = *qos;
+	struct iovec *bcode;
+
+	if (bt_bap_stream_get_type(bap->stream) != BT_BAP_STREAM_TYPE_BCAST) {
+		if (!memcmp(qos, &bap->qos, sizeof(bap->qos)))
+			return false;
+		bap->qos = *qos;
+		return true;
+	}
+
+	bcode = bap->qos.bcast.bcode;
+	cmp.bcast.bcode = bcode;
+	if (!memcmp(&cmp, &bap->qos, sizeof(bap->qos)))
+		return false;
+
+	bap->qos = cmp;
+
+	return true;
+}
+
 static void bap_update_qos(const struct media_transport *transport)
 {
 	struct bap_transport *bap = transport->data;
@@ -2075,10 +2117,8 @@ static void bap_update_qos(const struct media_transport *transport)
 
 	qos = bt_bap_stream_get_qos(bap->stream);
 
-	if (!memcmp(qos, &bap->qos, sizeof(struct bt_bap_qos)))
+	if (!bap_set_qos(bap, qos))
 		return;
-
-	bap->qos = *qos;
 
 	g_dbus_emit_property_changed(btd_get_dbus_connection(),
 			transport->path, MEDIA_TRANSPORT_INTERFACE,
@@ -2118,10 +2158,8 @@ static void bap_update_bcast_qos(const struct media_transport *transport)
 
 	qos = bt_bap_stream_get_qos(bap->stream);
 
-	if (!memcmp(qos, &bap->qos, sizeof(struct bt_bap_qos)))
+	if (!bap_set_qos(bap, qos))
 		return;
-
-	bap->qos = *qos;
 
 	g_dbus_emit_property_changed(btd_get_dbus_connection(),
 			transport->path, MEDIA_TRANSPORT_INTERFACE,
@@ -2480,6 +2518,8 @@ static void transport_bap_destroy(void *data)
 	bap_clear_chan(bap);
 
 	util_iov_free(bap->meta, 1);
+	if (bt_bap_stream_get_type(bap->stream) == BT_BAP_STREAM_TYPE_BCAST)
+		util_iov_free(bap->qos.bcast.bcode, 1);
 	bt_bap_state_unregister(bt_bap_stream_get_session(bap->stream),
 							bap->state_id);
 	free(bap);
@@ -2494,7 +2534,9 @@ static void *transport_bap_init(struct media_transport *transport, void *stream)
 
 	bap = new0(struct bap_transport, 1);
 	bap->stream = stream;
-	bap->qos = *qos;
+	bap_set_qos(bap, qos);
+	if (bt_bap_stream_get_type(stream) == BT_BAP_STREAM_TYPE_BCAST)
+		bap_take_bcode(bap, qos->bcast.bcode);
 	bap->state_id = bt_bap_state_register(bt_bap_stream_get_session(stream),
 						bap_state_changed,
 						bap_connecting,
