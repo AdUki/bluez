@@ -1804,8 +1804,6 @@ static struct bass_data *bass_data_new(struct btd_adapter *adapter,
 
 static void bass_data_add(struct bass_data *data)
 {
-	bool initiator = false;
-
 	DBG("data %p", data);
 
 	if (queue_find(sessions, NULL, data)) {
@@ -1820,16 +1818,17 @@ static void bass_data_add(struct bass_data *data)
 
 	queue_push_tail(sessions, data);
 
-	if (data->service) {
+	if (data->service)
 		btd_service_set_user_data(data->service, data);
-		initiator = btd_service_is_initiator(data->service);
-	}
 
-	if ((!initiator && btd_adapter_has_settings(data->adapter,
-				MGMT_SETTING_PAST_RECEIVER)) || (initiator &&
-				btd_adapter_has_settings(data->adapter,
-				MGMT_SETTING_PAST_SENDER)))
-		device_set_past_support(data->device, true);
+	/* No PAST flag here: the kernel reads it whenever it syncs to a
+	 * broadcast of this device's, and then waits up to 20 s for the device
+	 * to transfer the sync first. Set for every BASS peer (before the
+	 * session even knows who connected), it held the controller for those
+	 * 20 s at each BASE read of an LE Audio earbud or speaker that also
+	 * broadcasts, and scans asked for meanwhile never ran. An assistant
+	 * that asks for PAST says so in its Add Source (handle_add_src_req).
+	 */
 }
 
 static void bass_push_free(void *user_data)
