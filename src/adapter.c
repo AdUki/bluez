@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -313,6 +314,8 @@ struct btd_adapter {
 	struct discovery_client *client;	/* active discovery client */
 
 	GSList *discovery_found;	/* list of found devices */
+	time_t discovery_since;		/* when discovering began, 0 when not */
+	bool discovery_le;		/* and it heard LE devices since */
 	unsigned int discovery_idle_timeout; /* timeout between discovery
 					      * runs
 					      */
@@ -1744,11 +1747,39 @@ static void invalidate_rssi_and_tx_power(gpointer a)
 	device_set_tx_power(dev, 127);
 }
 
+/* When discovering began: called whenever it starts (the kernel saying so:
+ * the first call of a discovery counts), and by a client asking for one
+ * (`fresh`), whose scan starts the window again even when it joins one
+ * already running: the controller reports each advertiser once per scan
+ * it starts (duplicate filtering), so what was heard before says nothing
+ * about the scan asked for now.
+ */
+static void discovery_begins(struct btd_adapter *adapter, bool fresh)
+{
+	if (adapter->discovery_since && !fresh)
+		return;
+
+	adapter->discovery_since = time(NULL);
+	adapter->discovery_le = false;
+}
+
 static void discovery_cleanup(struct btd_adapter *adapter, int timeout)
 {
 	GSList *l, *next;
+	/* An LE discovery (by what it heard, not its type: the kernel's
+	 * Discovering event clears that before the last client goes) that
+	 * ended as asked (not the adapter going away) says which broadcasts
+	 * are gone.
+	 */
+	time_t since = timeout && adapter->discovery_le ?
+					adapter->discovery_since : 0;
 
 	adapter->discovery_type = 0x00;
+	adapter->discovery_since = 0;
+	adapter->discovery_le = false;
+
+	for (l = adapter->devices; l != NULL; l = g_slist_next(l))
+		btd_device_bcaa_scan_done(l->data, since);
 
 	if (adapter->discovery_idle_timeout > 0) {
 		timeout_remove(adapter->discovery_idle_timeout);
@@ -1903,6 +1934,7 @@ static void start_discovery_complete(uint8_t status, uint16_t length,
 	if (status == MGMT_STATUS_SUCCESS) {
 		adapter->discovery_type = rp->type;
 		adapter->discovery_enable = 0x01;
+		discovery_begins(adapter, false);
 
 		if (adapter->current_discovery_filter)
 			adapter->filtered_discovery = true;
@@ -2131,6 +2163,9 @@ static void discovering_callback(uint16_t index, uint16_t length,
 
 	DBG("hci%u type %u discovering %u method %d", adapter->dev_id, ev->type,
 				ev->discovering, adapter->filtered_discovery);
+
+	if (ev->discovering)
+		discovery_begins(adapter, false);
 
 	if (adapter->discovery_enable == ev->discovering)
 		return;
@@ -2559,8 +2594,15 @@ static DBusMessage *start_discovery(DBusConnection *conn,
 	 * Every client can only start one discovery, if the client
 	 * already started a discovery then return an error.
 	 */
-	if (is_discovering)
+	if (is_discovering) {
+		/* Its stop is still on the way (a controller busy syncing to
+		 * a BIG answers late): the scan it asks for starts now, the
+		 * controller's included, so what it reports is new.
+		 */
+		discovery_begins(adapter, true);
+		trigger_start_discovery(adapter, 0);
 		return btd_error_busy(msg);
+	}
 
 	/*
 	 * If there was pre-set filter, just reconnect it to discovery_list,
@@ -2590,6 +2632,8 @@ static DBusMessage *start_discovery(DBusConnection *conn,
 								client);
 
 done:
+	discovery_begins(adapter, true);
+
 	/*
 	 * Just trigger the discovery here. In case an already running
 	 * discovery in idle phase exists, it will be restarted right
@@ -7881,6 +7925,9 @@ static void device_found_callback(uint16_t index, uint16_t length,
 	ba2str(&ev->addr.bdaddr, addr);
 	DBG("hci%u addr %s, rssi %d flags 0x%04x eir_len %u",
 			index, addr, ev->rssi, flags, eir_len);
+
+	if (adapter->discovery_since && ev->addr.type != BDADDR_BREDR)
+		adapter->discovery_le = true;
 
 	btd_adapter_device_found(adapter, &ev->addr.bdaddr,
 					ev->addr.type, ev->rssi, flags,

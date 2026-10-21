@@ -9,6 +9,8 @@
  *
  */
 
+#include <time.h>
+
 #include "bluetooth/uuid.h"
 #include "src/shared/queue.h"
 
@@ -114,6 +116,7 @@ bool device_is_cable_pairing(struct btd_device *device);
 void device_set_paired(struct btd_device *dev, uint8_t bdaddr_type);
 void device_set_unpaired(struct btd_device *dev, uint8_t bdaddr_type);
 void btd_device_set_temporary(struct btd_device *device, bool temporary);
+void btd_device_bcaa_scan_done(struct btd_device *device, time_t since);
 void btd_device_set_trusted(struct btd_device *device, gboolean trusted);
 void btd_device_set_connectable(struct btd_device *device, bool connectable);
 void device_set_bonded(struct btd_device *device, uint8_t bdaddr_type);

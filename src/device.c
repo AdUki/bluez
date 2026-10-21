@@ -226,6 +226,7 @@ struct btd_device {
 	GSList		*svc_callbacks;
 	GSList		*eir_uuids;
 	uint8_t		bcaa_id[3];	/* Broadcast ID last probed */
+	time_t		bcaa_heard;	/* when the announcement was last heard */
 	struct bt_ad	*ad;
 	uint8_t         ad_flags[1];
 	char		name[MAX_NAME_LENGTH + 1];
@@ -2577,6 +2578,49 @@ static void device_probe_bcaa(struct btd_device *dev, const uint8_t *id,
 	g_slist_free(uuids);
 }
 
+/* An LE discovery that ran this long hears every broadcast in range: a
+ * broadcast's announcement goes out every second or so.
+ */
+#define BCAST_GONE_SECS 5
+
+/* Public Broadcast Announcement (PBP) */
+#define PBA_SERVICE_UUID	"00001856-0000-1000-8000-00805f9b34fb"
+
+/* An LE discovery that began at `since` (0: none) ended. A broadcast it did
+ * not hear, in at least BCAST_GONE_SECS of it, has ended: the announcement
+ * (and the Public Broadcast Announcement) leave the device's ServiceData and
+ * the broadcast source session goes, with the endpoints and transports of its
+ * BISes. Advertising data is otherwise kept for a device that stays (a bonded
+ * one), so without this a stopped broadcast stayed listed for good, rescans
+ * or not.
+ */
+void btd_device_bcaa_scan_done(struct btd_device *dev, time_t since)
+{
+	struct btd_profile *p;
+	bt_uuid_t uuid;
+	time_t now = time(NULL);
+
+	if (!since || now - since < BCAST_GONE_SECS ||
+			dev->bcaa_heard >= since)
+		return;
+
+	bt_string_to_uuid(&uuid, BCAA_SERVICE_UUID);
+	if (!bt_ad_remove_service_data(dev->ad, &uuid))
+		return;
+
+	DBG("%s: broadcast not heard, gone", dev->path);
+
+	bt_string_to_uuid(&uuid, PBA_SERVICE_UUID);
+	bt_ad_remove_service_data(dev->ad, &uuid);
+	g_dbus_emit_property_changed(dbus_conn, dev->path, DEVICE_INTERFACE,
+							"ServiceData");
+
+	memset(dev->bcaa_id, 0, sizeof(dev->bcaa_id));
+	p = btd_profile_find_remote_uuid(BCAA_SERVICE_UUID);
+	if (p)
+		device_remove_profile(dev, p);
+}
+
 static void add_service_data(void *data, void *user_data)
 {
 	struct eir_sd *sd = data;
@@ -2587,8 +2631,10 @@ static void add_service_data(void *data, void *user_data)
 	if (bt_string_to_uuid(&uuid, sd->uuid) < 0)
 		return;
 
-	if (!bt_uuid_strcmp(sd->uuid, BCAA_SERVICE_UUID))
+	if (!bt_uuid_strcmp(sd->uuid, BCAA_SERVICE_UUID)) {
+		dev->bcaa_heard = time(NULL);
 		device_probe_bcaa(dev, sd->data, sd->data_len);
+	}
 
 	if (!bt_ad_add_service_data(dev->ad, &uuid, sd->data, sd->data_len))
 		return;
