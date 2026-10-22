@@ -4087,6 +4087,27 @@ static int bap_disconnect(struct btd_service *service)
 	return 0;
 }
 
+static gboolean bcast_source_remove(gpointer user_data)
+{
+	struct btd_device *device = user_data;
+	struct btd_adapter *adapter = device_get_adapter(device);
+	struct btd_service *service;
+
+	service = btd_device_get_service(device, BCAAS_UUID_STR);
+
+	/* Keep it if it got paired, removed or used again meanwhile */
+	if (device_is_temporary(device) && !btd_device_is_connected(device) &&
+		btd_adapter_find_device(adapter, device_get_address(device),
+				btd_device_get_bdaddr_type(device)) == device &&
+		(!service || btd_service_get_state(service) ==
+					BTD_SERVICE_STATE_DISCONNECTED))
+		btd_adapter_remove_device(adapter, device);
+
+	btd_device_unref(device);
+
+	return FALSE;
+}
+
 static int bap_bcast_disconnect(struct btd_service *service)
 {
 	struct bap_data *data;
@@ -4110,6 +4131,16 @@ static int bap_bcast_disconnect(struct btd_service *service)
 	bt_bap_detach(data->bap);
 
 	btd_service_disconnecting_complete(service, 0);
+
+	/* The detached session can't sync to the source again, and while the
+	 * source keeps advertising the temporary device is never removed and
+	 * probed again. Like the BASS delegator, remove a Broadcast Source
+	 * found by scanning once its session ends, after the device is done
+	 * disconnecting its services.
+	 */
+	if (btd_service_get_user_data(service) == data)
+		g_idle_add(bcast_source_remove,
+				btd_device_ref(btd_service_get_device(service)));
 
 	return 0;
 }
