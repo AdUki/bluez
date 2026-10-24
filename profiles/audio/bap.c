@@ -1619,6 +1619,25 @@ static void bis_handler(uint8_t sid, uint8_t bis, uint8_t sgrp,
  */
 #define PA_SYNC_GRACE_TIMEOUT 5
 
+/* The kernel reports BIGInfo on a PA sync socket as POLLOUT, and the sync
+ * being lost (the Broadcast Source gone) as POLLERR: a watch for G_IO_OUT
+ * alone is never dispatched for the latter, while poll keeps returning it.
+ */
+#define PA_SYNC_WATCH (G_IO_OUT | G_IO_ERR | G_IO_HUP | G_IO_NVAL)
+#define PA_SYNC_LOST (G_IO_ERR | G_IO_HUP | G_IO_NVAL)
+
+static gboolean bcast_ended(gpointer user_data);
+
+static void pa_sync_lost(GIOChannel *io)
+{
+	int err = 0;
+	socklen_t len = sizeof(err);
+
+	getsockopt(g_io_channel_unix_get_fd(io), SOL_SOCKET, SO_ERROR, &err,
+									&len);
+	error("PA sync lost: %s (%d)", strerror(err), err);
+}
+
 static void pa_sync_release(struct bap_data *data)
 {
 	if (!data->pa_synced)
@@ -1681,6 +1700,22 @@ static gboolean big_info_report_cb(GIOChannel *io, GIOCondition cond,
 	struct iovec iov;
 	struct bt_bap_qos bap_qos = {0};
 	uint8_t sid;
+
+	if (cond & PA_SYNC_LOST) {
+		pa_sync_lost(io);
+		g_io_channel_shutdown(io, TRUE, NULL);
+		data->io_id = 0;
+		/* Nothing was found: drop the session, so that the next
+		 * announcement probes the broadcaster again.
+		 */
+		if (data->listen_io) {
+			g_io_channel_shutdown(data->listen_io, TRUE, NULL);
+			g_io_channel_unref(data->listen_io);
+			data->listen_io = NULL;
+		}
+		g_idle_add(bcast_ended, btd_device_ref(data->device));
+		return FALSE;
+	}
 
 	DBG("BIG Info received");
 
@@ -1745,7 +1780,7 @@ static void iso_pa_sync_confirm_cb(GIOChannel *io, void *user_data)
 	 * encryption flag is also available.
 	 */
 	DBG("PA Sync done");
-	data->io_id = g_io_add_watch(io, G_IO_OUT, big_info_report_cb,
+	data->io_id = g_io_add_watch(io, PA_SYNC_WATCH, big_info_report_cb,
 								user_data);
 }
 
@@ -3821,6 +3856,23 @@ static gboolean iso_do_big_sync(GIOChannel *io, GIOCondition cond,
 	struct bt_iso_qos qos;
 	struct queue *links = bt_bap_stream_io_get_links(setup->stream);
 
+	data->io_id = 0;
+
+	if (cond & PA_SYNC_LOST) {
+		pa_sync_lost(io);
+		/* The listener that made the sync goes too: enabling the
+		 * stream again then makes a new one.
+		 */
+		if (data->listen_io) {
+			g_io_channel_shutdown(data->listen_io, TRUE, NULL);
+			g_io_channel_unref(data->listen_io);
+			data->listen_io = NULL;
+		}
+		g_io_channel_shutdown(io, TRUE, NULL);
+		bt_bap_stream_set_io(setup->stream, -1);
+		return FALSE;
+	}
+
 	DBG("BIG info received, do BIG sync");
 
 	if (data->listen_io != io) {
@@ -3877,7 +3929,7 @@ static void long_pa_sync_confirm_cb(GIOChannel *io, void *user_data)
 	DBG("Long PA Sync done");
 
 	/* store io and add watch that will call iso_do_big_sync */
-	data->io_id = g_io_add_watch(io, G_IO_OUT, iso_do_big_sync,
+	data->io_id = g_io_add_watch(io, PA_SYNC_WATCH, iso_do_big_sync,
 							setup);
 }
 
@@ -3899,7 +3951,8 @@ static void pa_and_big_sync(struct bap_setup *setup)
 			bap_data->pa_timer = 0;
 		}
 
-		bap_data->io_id = g_io_add_watch(bap_data->listen_io, G_IO_OUT,
+		bap_data->io_id = g_io_add_watch(bap_data->listen_io,
+							PA_SYNC_WATCH,
 							iso_do_big_sync, setup);
 		return;
 	}
