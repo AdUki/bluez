@@ -134,6 +134,11 @@ struct btd_adapter_driver {
 						struct btd_device *device);
 	void (*device_resolved)(struct btd_adapter *adapter,
 						struct btd_device *device);
+	/* The adapter's current settings changed: the MGMT_SETTING_* bits
+	 * that did are set in changed.
+	 */
+	void (*settings_changed)(struct btd_adapter *adapter,
+						uint32_t changed);
 
 	/* Indicates the driver is experimental and shall only be registered
 	 * when experimental has been enabled (see: main.conf:Experimental).

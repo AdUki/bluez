@@ -4636,6 +4636,34 @@ int media_register(struct btd_adapter *btd_adapter)
 	return 0;
 }
 
+/* The LE Audio endpoints an adapter supports follow its CIS and ISO
+ * settings, which the kernel sets once the controller is up: an adapter
+ * registered before that (one probed late, or powered after bluetoothd
+ * started) first lists none. Tell the media applications, so they can
+ * register their LE Audio endpoints then.
+ */
+void media_settings_changed(struct btd_adapter *btd_adapter, uint32_t changed)
+{
+	GSList *l;
+
+	if (!(changed & (MGMT_SETTING_CIS_CENTRAL | MGMT_SETTING_CIS_PERIPHERAL |
+				MGMT_SETTING_ISO_BROADCASTER |
+				MGMT_SETTING_ISO_SYNC_RECEIVER)))
+		return;
+
+	for (l = adapters; l; l = l->next) {
+		struct media_adapter *adapter = l->data;
+
+		if (adapter->btd_adapter == btd_adapter) {
+			g_dbus_emit_property_changed(btd_get_dbus_connection(),
+						adapter_get_path(btd_adapter),
+						MEDIA_INTERFACE,
+						"SupportedUUIDs");
+			return;
+		}
+	}
+}
+
 void media_unregister(struct btd_adapter *btd_adapter)
 {
 	GSList *l;
