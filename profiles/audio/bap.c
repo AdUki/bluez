@@ -18,6 +18,7 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <sys/types.h>
@@ -1475,6 +1476,52 @@ static bool stream_io_unset(const void *data, const void *user_data)
 	return !bt_bap_stream_get_io(stream);
 }
 
+static int stream_bis(struct bt_bap_stream *stream)
+{
+	const char *path = bt_bap_stream_get_user_data(stream);
+	const char *strbis = path ? strstr(path, "/bis") : NULL;
+	int bis;
+
+	if (!strbis || sscanf(strbis, "/bis%d", &bis) != 1)
+		return INT_MAX;
+
+	return bis;
+}
+
+struct lowest_bis {
+	struct bt_bap_stream *stream;
+	int bis;
+};
+
+static void find_lowest_unset(void *data, void *user_data)
+{
+	struct bt_bap_stream *stream = data;
+	struct lowest_bis *l = user_data;
+	int bis;
+
+	if (bt_bap_stream_get_io(stream))
+		return;
+
+	bis = stream_bis(stream);
+	if (!l->stream || bis < l->bis) {
+		l->stream = stream;
+		l->bis = bis;
+	}
+}
+
+/* Of a stream and its links, the one with the lowest BIS index that has no
+ * fd yet.
+ */
+static struct bt_bap_stream *lowest_unset_bis(struct bt_bap_stream *stream)
+{
+	struct lowest_bis l = { NULL, INT_MAX };
+
+	find_lowest_unset(stream, &l);
+	queue_foreach(bt_bap_stream_io_get_links(stream), find_lowest_unset, &l);
+
+	return l.stream ? l.stream : stream;
+}
+
 static void iso_bcast_confirm_cb(GIOChannel *io, GError *err, void *user_data)
 {
 	struct bap_setup *setup = user_data;
@@ -1489,11 +1536,10 @@ static void iso_bcast_confirm_cb(GIOChannel *io, GError *err, void *user_data)
 
 	/* The order of the BIS fds notified from kernel corresponds
 	 * to the order of the BISes that were enqueued before
-	 * calling bt_io_bcast_accept.
+	 * calling bt_io_bcast_accept, which is ascending (see
+	 * iso_do_big_sync): this fd is the lowest BIS still without one.
 	 */
-	if (bt_bap_stream_get_io(stream))
-		stream = queue_find(bt_bap_stream_io_get_links(stream),
-				stream_io_unset, NULL);
+	stream = lowest_unset_bis(stream);
 
 	fd = g_io_channel_unix_get_fd(io);
 
@@ -3760,6 +3806,11 @@ static void setup_refresh_qos(void *data, void *user_data)
 	setup->qos = *bt_bap_stream_get_qos(stream);
 }
 
+static int cmp_bis(const void *a, const void *b)
+{
+	return *(const uint8_t *)a - *(const uint8_t *)b;
+}
+
 static gboolean iso_do_big_sync(GIOChannel *io, GIOCondition cond,
 						void *user_data)
 {
@@ -3782,6 +3833,14 @@ static gboolean iso_do_big_sync(GIOChannel *io, GIOCondition cond,
 	/* Append each linked BIS to the BIG sync request */
 	append_setup(setup->stream, &iso_bc_addr);
 	queue_foreach(links, append_setup, &iso_bc_addr);
+
+	/* LE BIG Create Sync takes the BIS indices in ascending order
+	 * (Core v6.0, Vol 4, Part E, 7.8.106): the stream acquired first
+	 * need not be the lowest, and the controller refuses the list
+	 * otherwise (Invalid HCI Command Parameters).
+	 */
+	qsort(iso_bc_addr.bc_bis, iso_bc_addr.bc_num_bis,
+				sizeof(iso_bc_addr.bc_bis[0]), cmp_bis);
 
 	/* Refresh qos stored in setups */
 	setup->qos = *bt_bap_stream_get_qos(setup->stream);
