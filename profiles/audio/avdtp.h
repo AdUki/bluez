@@ -297,6 +297,7 @@ int avdtp_unregister_sep(struct queue *lseps, uint64_t *seid_pool,
 						struct avdtp_local_sep *sep);
 
 avdtp_state_t avdtp_stream_get_state(struct avdtp_stream *stream);
+struct avdtp_stream *avdtp_get_pending_open(struct avdtp *session);
 uint8_t avdtp_sep_get_seid(struct avdtp_local_sep *sep);
 
 void avdtp_error_init(struct avdtp_error *err, uint8_t type, int id);

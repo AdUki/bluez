@@ -521,20 +521,6 @@ static struct a2dp_setup *find_setup_by_session(struct avdtp *session)
 	return NULL;
 }
 
-static struct a2dp_setup *a2dp_setup_get(struct avdtp *session)
-{
-	struct a2dp_setup *setup;
-
-	setup = find_setup_by_session(session);
-	if (!setup) {
-		setup = setup_new(session);
-		if (!setup)
-			return NULL;
-	}
-
-	return setup_ref(setup);
-}
-
 static struct a2dp_setup *find_setup_by_stream(struct avdtp_stream *stream)
 {
 	GSList *l;
@@ -547,6 +533,91 @@ static struct a2dp_setup *find_setup_by_stream(struct avdtp_stream *stream)
 	}
 
 	return NULL;
+}
+
+/* A setup is the configuration of one local SEP on a session. The remote
+ * may configure one SEP while we configure another on the same session, so
+ * each SEP needs a setup of its own: a shared one would have its sep and
+ * stream replaced under the configuration still in progress.
+ */
+static struct a2dp_setup *find_setup(struct avdtp *session,
+						struct a2dp_sep *sep)
+{
+	GSList *l;
+
+	for (l = setups; l != NULL; l = l->next) {
+		struct a2dp_setup *setup = l->data;
+
+		if (setup->session == session && setup->sep == sep)
+			return setup;
+	}
+
+	return NULL;
+}
+
+/* Closing a stream to configure another SEP reports to the setup that
+ * asked for the close, not to the setup of the SEP being closed.
+ */
+static struct a2dp_setup *find_setup_closing(struct avdtp *session,
+						struct a2dp_sep *sep)
+{
+	GSList *l;
+
+	for (l = setups; l != NULL; l = l->next) {
+		struct a2dp_setup *setup = l->data;
+
+		if (setup->session == session && setup->reconfigure)
+			return setup;
+	}
+
+	return find_setup(session, sep);
+}
+
+/* A transport channel belongs to the stream AVDTP has pending open. Before
+ * any Open it goes to a setup whose stream has no transport yet.
+ */
+static struct a2dp_setup *find_setup_opening(struct avdtp *session)
+{
+	struct avdtp_stream *pending = avdtp_get_pending_open(session);
+	GSList *l;
+
+	if (pending) {
+		struct a2dp_setup *setup = find_setup_by_stream(pending);
+
+		if (setup && setup->session == session && !setup->io)
+			return setup;
+
+		return NULL;
+	}
+
+	for (l = setups; l != NULL; l = l->next) {
+		struct a2dp_setup *setup = l->data;
+
+		if (setup->session != session || !setup->stream || setup->io)
+			continue;
+
+		if (!avdtp_stream_get_transport(setup->stream, NULL, NULL,
+								NULL, NULL))
+			return setup;
+	}
+
+	return NULL;
+}
+
+static struct a2dp_setup *a2dp_setup_get(struct avdtp *session,
+						struct a2dp_sep *sep)
+{
+	struct a2dp_setup *setup;
+
+	setup = find_setup(session, sep);
+	if (!setup) {
+		setup = setup_new(session);
+		if (!setup)
+			return NULL;
+		setup->sep = sep;
+	}
+
+	return setup_ref(setup);
 }
 
 static bool match_stream_session(const void *data, const void *user_data)
@@ -898,7 +969,7 @@ static gboolean endpoint_setconf_ind(struct avdtp *session,
 	if (!a2dp_stream)
 		return FALSE;
 
-	setup = a2dp_setup_get(session);
+	setup = a2dp_setup_get(session, a2dp_sep);
 	if (!setup)
 		return FALSE;
 
@@ -1161,7 +1232,7 @@ static void setconf_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 		return;
 	}
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 
 	if (err) {
 		if (setup) {
@@ -1333,7 +1404,7 @@ static gboolean open_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 	else
 		DBG("Source %p: Open_Ind", sep);
 
-	setup = a2dp_setup_get(session);
+	setup = a2dp_setup_get(session, a2dp_sep);
 	if (!setup)
 		return FALSE;
 
@@ -1362,7 +1433,7 @@ static void open_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	else
 		DBG("Source %p: Open_Cfm", sep);
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (!setup)
 		return;
 
@@ -1420,7 +1491,7 @@ static gboolean start_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 
 	a2dp_stream->starting = FALSE;
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (setup)
 		finalize_resume(setup);
 
@@ -1446,7 +1517,7 @@ static void start_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 
 	a2dp_stream->starting = FALSE;
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (!setup)
 		return;
 
@@ -1487,7 +1558,7 @@ static gboolean suspend_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 
 	a2dp_stream->suspending = FALSE;
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (!setup)
 		return TRUE;
 
@@ -1530,7 +1601,7 @@ static void suspend_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 
 	a2dp_stream->suspending = FALSE;
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (!setup)
 		return;
 
@@ -1571,7 +1642,7 @@ static gboolean close_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 	else
 		DBG("Source %p: Close_Ind", sep);
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (!setup)
 		return TRUE;
 
@@ -1684,7 +1755,7 @@ static void close_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	else
 		DBG("Source %p: Close_Cfm", sep);
 
-	setup = find_setup_by_session(session);
+	setup = find_setup_closing(session, a2dp_sep);
 	if (!setup)
 		return;
 
@@ -1715,7 +1786,7 @@ static void abort_ind(struct avdtp *session, struct avdtp_local_sep *sep,
 
 	a2dp_stream_destroy(a2dp_sep, stream);
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (!setup)
 		return;
 
@@ -1738,7 +1809,7 @@ static void abort_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	else
 		DBG("Source %p: Abort_Cfm", sep);
 
-	setup = find_setup_by_session(session);
+	setup = find_setup_closing(session, a2dp_sep);
 	if (!setup)
 		return;
 
@@ -1794,7 +1865,7 @@ static void reconf_cfm(struct avdtp *session, struct avdtp_local_sep *sep,
 	else
 		DBG("Source %p: ReConfigure_Cfm", sep);
 
-	setup = find_setup_by_session(session);
+	setup = find_setup(session, a2dp_sep);
 	if (!setup)
 		return;
 
@@ -1968,8 +2039,7 @@ static void channel_free(void *data)
 	queue_destroy(chan->seps, remove_remote_sep);
 	free(chan->last_used);
 
-	setup = find_setup_by_session(chan->session);
-	if (setup) {
+	while ((setup = find_setup_by_session(chan->session))) {
 		setup->chan = NULL;
 		setup_ref(setup);
 		/* Finalize pending commands before we NULL setup->session */
@@ -2120,7 +2190,7 @@ static int a2dp_reconfig(struct a2dp_channel *chan, const char *sender,
 	if (!chan->session)
 		return -ENOTCONN;
 
-	setup = a2dp_setup_get(chan->session);
+	setup = a2dp_setup_get(chan->session, lsep);
 	if (!setup)
 		return -ENOMEM;
 
@@ -2804,13 +2874,9 @@ static void confirm_cb(GIOChannel *io, gpointer data)
 	if (chan) {
 		struct a2dp_setup *setup;
 
-		setup = find_setup_by_session(chan->session);
-		if (!setup || !setup->stream)
-			goto drop;
-
-		if (setup->io || avdtp_stream_get_transport(setup->stream,
-						NULL, NULL, NULL, NULL)) {
-			error("transport channel already exists");
+		setup = find_setup_opening(chan->session);
+		if (!setup) {
+			error("no stream waits for a transport channel");
 			goto drop;
 		}
 
@@ -3204,7 +3270,7 @@ unsigned int a2dp_discover(struct avdtp *session, a2dp_discover_cb_t cb,
 	struct a2dp_setup *setup;
 	struct a2dp_setup_cb *cb_data;
 
-	setup = a2dp_setup_get(session);
+	setup = a2dp_setup_get(session, NULL);
 	if (!setup)
 		return 0;
 
@@ -3232,6 +3298,7 @@ unsigned int a2dp_select_capabilities(struct avdtp *session,
 	struct a2dp_setup *setup;
 	struct a2dp_setup_cb *cb_data;
 	struct queue *eps;
+	struct a2dp_sep *sep;
 	struct avdtp_service_capability *service;
 	struct avdtp_media_codec_capability *codec;
 	int err;
@@ -3242,16 +3309,21 @@ unsigned int a2dp_select_capabilities(struct avdtp *session,
 		return 0;
 	}
 
-	setup = a2dp_setup_get(session);
-	if (!setup)
+	sep = queue_pop_head(eps);
+
+	setup = a2dp_setup_get(session, sep);
+	if (!setup) {
+		queue_destroy(eps, NULL);
 		return 0;
+	}
 
 	cb_data = setup_cb_add(setup);
 	cb_data->select_cb = cb;
 	cb_data->user_data = user_data;
 
+	queue_destroy(setup->eps, NULL);
 	setup->eps = eps;
-	setup->sep = queue_pop_head(eps);
+	setup->sep = sep;
 	setup->rsep = find_remote_sep(setup->chan, setup->sep);
 
 	if (setup->rsep == NULL) {
@@ -3315,13 +3387,24 @@ unsigned int a2dp_config(struct avdtp *session, struct a2dp_sep *sep,
 
 	DBG("a2dp_config: selected SEP %p", sep->lsep);
 
-	setup = a2dp_setup_get(session);
+	setup = a2dp_setup_get(session, sep);
 	if (!setup)
 		return 0;
 
 	cb_data = setup_cb_add(setup);
 	cb_data->config_cb = cb;
 	cb_data->user_data = user_data;
+
+	/* The remote's Set Configuration of this SEP is still waiting for the
+	 * endpoint. Sending our own would replace setup->stream, and
+	 * auto_config() would then never answer the remote. The remote's
+	 * stream is the one we want: auto_config() hands it to us through
+	 * finalize_config().
+	 */
+	if (setup->setconf_cb) {
+		DBG("Remote configuration of SEP %p in progress", sep->lsep);
+		return cb_data->id;
+	}
 
 	stream = queue_find(sep->streams, match_stream_session, session);
 
@@ -3415,7 +3498,7 @@ unsigned int a2dp_resume(struct avdtp *session, struct a2dp_sep *sep,
 	struct a2dp_setup *setup;
 	struct a2dp_stream *stream;
 
-	setup = a2dp_setup_get(session);
+	setup = a2dp_setup_get(session, sep);
 	if (!setup)
 		return 0;
 
@@ -3476,7 +3559,7 @@ unsigned int a2dp_suspend(struct avdtp *session, struct a2dp_sep *sep,
 	struct a2dp_setup *setup;
 	struct a2dp_stream *stream;
 
-	setup = a2dp_setup_get(session);
+	setup = a2dp_setup_get(session, sep);
 	if (!setup)
 		return 0;
 

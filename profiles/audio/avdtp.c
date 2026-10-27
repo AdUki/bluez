@@ -3269,6 +3269,11 @@ struct avdtp_remote_sep *avdtp_stream_get_remote_sep(
 	return NULL;
 }
 
+struct avdtp_stream *avdtp_get_pending_open(struct avdtp *session)
+{
+	return session->pending_open;
+}
+
 gboolean avdtp_stream_set_transport(struct avdtp_stream *stream, int fd,
 						size_t imtu, size_t omtu)
 {
